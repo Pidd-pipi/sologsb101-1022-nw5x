@@ -9,6 +9,7 @@ import GradeTag from '@/components/common/GradeTag.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
 import { useMaterialStore, type MaterialRow } from '@/stores/materialStore'
 import { useFormulaStore } from '@/stores/formulaStore'
+import { isMasterConflictError } from '@/utils/master'
 import {
   MATERIAL_GRADES,
   PROCESS_METHODS,
@@ -27,6 +28,10 @@ const dialogVisible = ref(false)
 const submitting = ref(false)
 const editingId = ref<string | null>(null)
 const formRef = ref<FormInstance>()
+/** 打开编辑弹窗时看到的主档修订号，保存时做乐观并发校验 */
+const expectedRev = ref(1)
+/** 保存时发现主档已被别处升版：保留草稿，展示冲突并允许带草稿重试 */
+const conflict = ref<{ actualRev: number; message: string } | null>(null)
 
 const form = reactive<{
   name: string
@@ -136,6 +141,7 @@ function handleReset(): void {
 
 function openCreate(): void {
   editingId.value = null
+  conflict.value = null
   form.name = ''
   form.origin = ''
   form.grade = '一级'
@@ -147,6 +153,8 @@ function openCreate(): void {
 
 function openEdit(material: Material): void {
   editingId.value = material.id
+  conflict.value = null
+  expectedRev.value = material.rev
   form.name = material.name
   form.origin = material.origin
   form.grade = material.grade
@@ -156,6 +164,12 @@ function openEdit(material: Material): void {
   dialogVisible.value = true
 }
 
+function cascadeMessage(result: { revBumped: boolean; proportions: number; batches: number; lockedBatches: number }): string {
+  if (!result.revBumped) return '香料信息已更新（未改等级/炮制，配比与批次写法不动）'
+  return `主档修订号已推进，已联动重算未固化配比 ${result.proportions} 条、未入窖批次快照 ${result.batches} 个` +
+    (result.lockedBatches > 0 ? `；${result.lockedBatches} 个已入窖批次锁住旧写法` : '')
+}
+
 async function submitForm(): Promise<void> {
   if (!formRef.value) return
   const valid = await formRef.value.validate().catch(() => false)
@@ -163,15 +177,16 @@ async function submitForm(): Promise<void> {
   submitting.value = true
   try {
     if (editingId.value) {
-      await materialStore.updateMaterial(editingId.value, {
+      const result = await materialStore.updateMaterial(editingId.value, {
         name: form.name.trim(),
         origin: form.origin.trim(),
         grade: form.grade,
         processMethod: form.processMethod,
         aromaNote: form.aromaNote.trim(),
-        createdAt: form.createdAt
+        createdAt: form.createdAt,
+        expectedRev: expectedRev.value
       })
-      ElMessage.success('香料信息已更新')
+      ElMessage.success(cascadeMessage(result))
     } else {
       await materialStore.createMaterial({
         name: form.name,
@@ -183,7 +198,17 @@ async function submitForm(): Promise<void> {
       })
       ElMessage.success(`已入库香料「${form.name.trim()}」`)
     }
+    conflict.value = null
     dialogVisible.value = false
+  } catch (err) {
+    if (isMasterConflictError(err)) {
+      // 另一处（如另一个开着的页面）已升版主档：表单草稿保留，改用最新修订号重试
+      expectedRev.value = err.actualRev
+      conflict.value = { actualRev: err.actualRev, message: err.message }
+      ElMessage.warning('主档刚被别处改动，页面已按最新主档重算，草稿已保留，确认后可重试')
+    } else {
+      throw err
+    }
   } finally {
     submitting.value = false
   }
@@ -191,8 +216,21 @@ async function submitForm(): Promise<void> {
 
 async function changeProcess(row: MaterialRow, method: ProcessMethod): Promise<void> {
   if (row.material.processMethod === method) return
-  await materialStore.setProcessMethod(row.material.id, method)
-  ElMessage.success(`「${row.material.name}」炮制方式已改为「${method}」`)
+  try {
+    const result = await materialStore.setProcessMethod(row.material.id, method)
+    ElMessage.success(cascadeMessage({
+      revBumped: result.revBumped,
+      proportions: result.proportions,
+      batches: result.batches,
+      lockedBatches: result.lockedBatches
+    }) + `：「${row.material.name}」炮制改为「${method}」`)
+  } catch (err) {
+    if (isMasterConflictError(err)) {
+      ElMessage.error(`炮制方式保存失败：${err.message}。请打开编辑弹窗查看最新主档后重试`)
+    } else {
+      throw err
+    }
+  }
 }
 
 async function removeMaterial(row: MaterialRow): Promise<void> {
@@ -301,6 +339,7 @@ function consumedBy(row: MaterialRow): string {
             >
               <el-option v-for="item in PROCESS_METHODS" :key="item" :label="item" :value="item" />
             </el-select>
+            <el-tag size="small" effect="plain" round class="rev-tag">v{{ row.material.rev }}</el-tag>
           </template>
         </el-table-column>
         <el-table-column label="引用香方" min-width="200">
@@ -323,6 +362,15 @@ function consumedBy(row: MaterialRow): string {
     </div>
 
     <el-dialog v-model="dialogVisible" :title="editingId ? '编辑香料' : '新增香料'" width="560px" append-to-body>
+      <el-alert
+        v-if="conflict"
+        class="conflict-alert"
+        type="warning"
+        :closable="false"
+        show-icon
+        :title="`保存失败：主档已被别处改动，当前修订号 v${conflict.actualRev}`"
+        :description="conflict.message"
+      />
       <el-form ref="formRef" :model="form" :rules="rules" label-width="96px">
         <el-form-item label="香料名" prop="name">
           <el-input v-model="form.name" placeholder="如：海南沉香" maxlength="20" show-word-limit />
@@ -363,7 +411,7 @@ function consumedBy(row: MaterialRow): string {
       <template #footer>
         <el-button @click="dialogVisible = false">取消</el-button>
         <el-button type="primary" :loading="submitting" @click="submitForm">
-          {{ editingId ? '保存修改' : '入库' }}
+          {{ conflict ? '带着草稿按最新主档重试' : editingId ? '保存修改' : '入库' }}
         </el-button>
       </template>
     </el-dialog>
@@ -386,5 +434,14 @@ function consumedBy(row: MaterialRow): string {
 .cell-sub {
   font-size: 12px;
   line-height: 1.6;
+}
+
+.conflict-alert {
+  margin-bottom: 14px;
+}
+
+.rev-tag {
+  margin-left: 6px;
+  font-variant-numeric: tabular-nums;
 }
 </style>

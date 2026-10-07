@@ -7,6 +7,14 @@ export interface BatchSnapshotItem {
   materialName: string
   ratio: number
   role: string
+  /**
+   * 快照落字时的等级与炮制方式。
+   * 未入窖批次随主档联动重算保持最新；已入窖批次锁住入窖当时写法，不再跟随主档。
+   */
+  grade: string
+  processMethod: string
+  /** 该条目停在的主档修订号 */
+  materialRev: number
 }
 
 export interface Batch {
@@ -40,9 +48,13 @@ export interface BatchRow {
   currentRatioTotal: number
   /** 快照配比合计 */
   snapshotRatioTotal: number
-  /** 是否已进入窖藏 */
+  /** 是否已进入窖藏（入窖即锁住快照写法） */
   cellared: boolean
   cellarState: string
+  /** 快照是否锁住：已入窖为 true，主档再改也不重算 */
+  snapshotLocked: boolean
+  /** 未入窖批次的快照中，有多少味已落后于主档修订号 */
+  staleSnapshotCount: number
 }
 
 /** 批次筛选条件 */

@@ -16,8 +16,16 @@ export interface Material {
   aromaNote: string
   /** 入库日期（ISO 日期串 yyyy-MM-dd） */
   createdAt: string
+  /**
+   * 主档修订号：仅「等级 / 炮制方式」发生变化时 +1，其余字段（名称、产地等）不递增。
+   * 配比与批次快照用它判断自己停在哪个主档写法上。
+   */
+  rev: number
   updatedAt: number
 }
+
+/** 主档修订号起点：v3 升级回填与新建香料均取此值 */
+export const INITIAL_MATERIAL_REV = 1
 
 export const MATERIAL_GRADES: MaterialGrade[] = ['特级', '一级', '二级']
 export const PROCESS_METHODS: ProcessMethod[] = ['生用', '酒蒸', '蜜炙', '炒黄', '醋浸']

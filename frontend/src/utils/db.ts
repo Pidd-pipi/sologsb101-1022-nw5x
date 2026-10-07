@@ -5,9 +5,11 @@ import type { Proportion } from '@/types/proportion'
 import type { Batch } from '@/types/batch'
 import type { Cellar } from '@/types/cellar'
 import type { Tasting } from '@/types/tasting'
+import { INITIAL_MATERIAL_REV } from '@/types/material'
+import { normalizeMaterialRev, normalizeSnapshotItem } from '@/utils/master'
 
 /** 本地结构版本号：新增/修改表结构时必须递增，并补充 upgrade 迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** 本地存储键名（localStorage 侧的少量元数据） */
 export const LS_KEYS = {
@@ -64,7 +66,7 @@ export class IncenseDatabase extends Dexie {
       tastings: 'id, batchId, tastedAt, smokeScore'
     })
     // v2：配比表补 seq 索引、批次与窖藏补日期索引，并回填历史脏数据
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         formulas: 'id, name, scentType, usage, state, createdAt, totalRatio, updatedAt',
         materials: 'id, name, origin, grade, processMethod, updatedAt',
@@ -106,6 +108,53 @@ export class IncenseDatabase extends Dexie {
             if (typeof tasting.lastingMin !== 'number' || Number.isNaN(tasting.lastingMin)) {
               tasting.lastingMin = 0
             }
+          })
+      })
+    // v3：香料主档加 rev 修订号、配比加 materialRev 指针；
+    // 历史数据没有修订号，升级时按当前值回填，并把批次快照补齐等级/炮制写法。
+    this.version(DB_VERSION)
+      .stores({
+        formulas: 'id, name, scentType, usage, state, createdAt, totalRatio, updatedAt',
+        materials: 'id, name, origin, grade, processMethod, rev, updatedAt',
+        proportions: 'id, formulaId, materialId, role, materialRev, seq, updatedAt',
+        batches: 'id, formulaId, mixedAt, formingMethod, updatedAt',
+        cellars: 'id, batchId, startDate, endDate, state, updatedAt',
+        tastings: 'id, batchId, tastedAt, smokeScore, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        // 主档按当前值回填修订号（历史数据即停在当前写法上）
+        const materialList = await tx.table<Material>('materials').toArray()
+        const byId = new Map<string, Material>(
+          materialList.map((material) => [material.id, { ...material, rev: normalizeMaterialRev(material) }])
+        )
+
+        // 回填主档修订号
+        await tx
+          .table<Material>('materials')
+          .toCollection()
+          .modify((material) => {
+            material.rev = byId.get(material.id)?.rev ?? INITIAL_MATERIAL_REV
+          })
+
+        // 配比回填 materialRev：按所引主档当前修订号回填
+        await tx
+          .table<Proportion>('proportions')
+          .toCollection()
+          .modify((proportion) => {
+            if (typeof proportion.materialRev !== 'number' || Number.isNaN(proportion.materialRev)) {
+              proportion.materialRev = byId.get(proportion.materialId)?.rev ?? INITIAL_MATERIAL_REV
+            }
+          })
+
+        // 批次快照补齐等级/炮制/修订号：历史数据没有这些字段，统一按主档当前值回填
+        // （已入窖批次从此刻起锁住回填时的写法，之后主档再改不会联动它）
+        await tx
+          .table<Batch>('batches')
+          .toCollection()
+          .modify((batch) => {
+            if (!Array.isArray(batch.snapshot)) batch.snapshot = []
+            if (typeof batch.snapshotAt !== 'number') batch.snapshotAt = 0
+            batch.snapshot = batch.snapshot.map((item) => normalizeSnapshotItem(item, byId.get(item.materialId)))
           })
       })
   }
@@ -313,6 +362,7 @@ export async function seedDatabase(): Promise<void> {
       processMethod: '生用',
       aromaNote: '清甜带凉，尾韵有蔗糖气',
       createdAt: '2024-02-18',
+      rev: INITIAL_MATERIAL_REV,
       updatedAt: now
     },
     {
@@ -323,6 +373,7 @@ export async function seedDatabase(): Promise<void> {
       processMethod: '酒蒸',
       aromaNote: '奶香厚重，留香绵长',
       createdAt: '2024-02-20',
+      rev: INITIAL_MATERIAL_REV,
       updatedAt: now
     },
     {
@@ -333,6 +384,7 @@ export async function seedDatabase(): Promise<void> {
       processMethod: '醋浸',
       aromaNote: '树脂清香，微带柑橘前调',
       createdAt: '2024-04-02',
+      rev: INITIAL_MATERIAL_REV,
       updatedAt: now
     },
     {
@@ -343,6 +395,7 @@ export async function seedDatabase(): Promise<void> {
       processMethod: '炒黄',
       aromaNote: '辛香穿透，少许即显',
       createdAt: '2024-04-06',
+      rev: INITIAL_MATERIAL_REV,
       updatedAt: now
     }
   ]
@@ -360,6 +413,7 @@ export async function seedDatabase(): Promise<void> {
         ratio: row[2],
         role: row[3],
         note: row[4],
+        materialRev: INITIAL_MATERIAL_REV,
         seq: index + 1,
         updatedAt: now
       })
@@ -375,7 +429,10 @@ export async function seedDatabase(): Promise<void> {
         materialId: row[0],
         materialName: material?.name ?? '未知香料',
         ratio: row[2],
-        role: row[3]
+        role: row[3],
+        grade: material?.grade ?? '—',
+        processMethod: material?.processMethod ?? '—',
+        materialRev: material?.rev ?? INITIAL_MATERIAL_REV
       }
     })
 

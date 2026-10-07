@@ -11,6 +11,7 @@ import { useFormulaStore } from '@/stores/formulaStore'
 import { useMaterialStore } from '@/stores/materialStore'
 import { useProportionStore } from '@/stores/proportionStore'
 import { useProportion, type ProportionRow } from '@/hooks/useProportion'
+import { isMasterConflictError } from '@/utils/master'
 import { PROPORTION_ROLES, ROLE_COLOR, ROLE_HINT, type ProportionRole } from '@/types/proportion'
 import { MATERIAL_GRADES } from '@/types/material'
 import { formatPercent, round } from '@/utils/ratio'
@@ -29,6 +30,10 @@ const editingId = ref<string | null>(null)
 const formRef = ref<FormInstance>()
 const draggingId = ref<string | null>(null)
 const dragOverId = ref<string | null>(null)
+/** 编辑弹窗里当前所选香料开弹窗时的主档修订号，换香料保存时做乐观并发校验 */
+const expectedMaterialRev = ref(1)
+/** 保存时发现所选香料主档已被别处升版：保留草稿，展示冲突并允许重试 */
+const conflict = ref<string | null>(null)
 
 const form = reactive<{
   materialId: string
@@ -198,7 +203,9 @@ function openCreate(): void {
     return
   }
   editingId.value = null
+  conflict.value = null
   form.materialId = materialStore.materials[0]?.id ?? ''
+  expectedMaterialRev.value = materialStore.materials[0]?.rev ?? 1
   form.ratio = 10
   form.role = '君'
   form.note = ''
@@ -207,11 +214,19 @@ function openCreate(): void {
 
 function openEdit(row: ProportionRow): void {
   editingId.value = row.proportion.id
+  conflict.value = null
   form.materialId = row.proportion.materialId
+  expectedMaterialRev.value = row.materialRev ?? row.proportion.materialRev
   form.ratio = row.ratio
   form.role = row.role
   form.note = row.proportion.note
   dialogVisible.value = true
+}
+
+/** 弹窗里更换所选香料时，记下新香料当前主档修订号 */
+function onMaterialChange(materialId: string): void {
+  conflict.value = null
+  expectedMaterialRev.value = materialStore.materialById(materialId)?.rev ?? 1
 }
 
 async function submitForm(): Promise<void> {
@@ -221,18 +236,32 @@ async function submitForm(): Promise<void> {
   submitting.value = true
   try {
     if (editingId.value) {
-      await update(editingId.value, {
-        materialId: form.materialId,
-        ratio: form.ratio,
-        role: form.role,
-        note: form.note
-      })
+      await update(
+        editingId.value,
+        {
+          materialId: form.materialId,
+          ratio: form.ratio,
+          role: form.role,
+          note: form.note
+        },
+        { expectedMaterialRev: expectedMaterialRev.value }
+      )
       ElMessage.success('配比已更新')
     } else {
       await add({ materialId: form.materialId, ratio: form.ratio, role: form.role, note: form.note })
       ElMessage.success('已加入配比，可继续调整占比')
     }
+    conflict.value = null
     dialogVisible.value = false
+  } catch (err) {
+    if (isMasterConflictError(err)) {
+      // 另一开着的页面刚升过这味香料的主档：草稿保留，按最新主档重算后重试
+      expectedMaterialRev.value = err.actualRev
+      conflict.value = err.message
+      ElMessage.warning('该香料主档已被别处改动，页面已按最新主档重算，草稿已保留，确认后可重试')
+    } else {
+      throw err
+    }
   } finally {
     submitting.value = false
   }
@@ -455,6 +484,8 @@ const roleColor = (role: ProportionRole): string => ROLE_COLOR[role]
             <strong>{{ row.materialName }}</strong>
             <span class="drag-row__sub muted">{{ row.origin }} · {{ row.processMethod }}</span>
             <GradeTag v-if="row.grade !== '未知'" :grade="row.grade" plain size="small" />
+            <el-tag v-if="row.stale" type="warning" size="small" effect="plain" round>写法已落后主档，待重算</el-tag>
+            <el-tag v-else size="small" effect="plain" round class="rev-tag">主档 v{{ row.materialRev ?? '—' }}</el-tag>
           </span>
           <span class="drag-row__role">
             <el-tag :style="{ backgroundColor: roleColor(row.role), color: '#fff', borderColor: roleColor(row.role) }" round>
@@ -492,9 +523,24 @@ const roleColor = (role: ProportionRole): string => ROLE_COLOR[role]
     </div>
 
     <el-dialog v-model="dialogVisible" :title="editingId ? '编辑配比' : '新增配比'" width="560px" append-to-body>
+      <el-alert
+        v-if="conflict"
+        class="conflict-alert"
+        type="warning"
+        :closable="false"
+        show-icon
+        title="保存失败：所选香料主档已被别处升版"
+        :description="conflict"
+      />
       <el-form ref="formRef" :model="form" :rules="rules" label-width="104px">
         <el-form-item label="香料" prop="materialId">
-          <el-select v-model="form.materialId" filterable placeholder="选择香料" style="width: 100%">
+          <el-select
+            v-model="form.materialId"
+            filterable
+            placeholder="选择香料"
+            style="width: 100%"
+            @update:model-value="(value: string) => onMaterialChange(value)"
+          >
             <el-option v-for="item in materialOptions" :key="item.value" :label="item.label" :value="item.value" />
           </el-select>
         </el-form-item>
@@ -516,7 +562,7 @@ const roleColor = (role: ProportionRole): string => ROLE_COLOR[role]
       <template #footer>
         <el-button @click="dialogVisible = false">取消</el-button>
         <el-button type="primary" :loading="submitting" @click="submitForm">
-          {{ editingId ? '保存修改' : '加入配比' }}
+          {{ conflict ? '带着草稿按最新主档重试' : editingId ? '保存修改' : '加入配比' }}
         </el-button>
       </template>
     </el-dialog>
@@ -626,5 +672,13 @@ const roleColor = (role: ProportionRole): string => ROLE_COLOR[role]
 .form-hint {
   margin-left: 10px;
   font-size: 12px;
+}
+
+.conflict-alert {
+  margin-bottom: 14px;
+}
+
+.rev-tag {
+  font-variant-numeric: tabular-nums;
 }
 </style>

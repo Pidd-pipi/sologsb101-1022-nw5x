@@ -5,12 +5,14 @@ import { useIdbTable } from '@/hooks/useIdbTable'
 import {
   createEmptyMaterialFilter,
   GRADE_WEIGHT,
+  INITIAL_MATERIAL_REV,
   type Material,
   type MaterialFilterState,
   type MaterialGrade,
   type ProcessMethod
 } from '@/types/material'
 import type { Proportion, ProportionRole } from '@/types/proportion'
+import { updateMaterialWithCascade, type MaterialCascadeResult } from '@/utils/master'
 
 /** 香料库一行：香料 + 被引用情况 */
 export interface MaterialRow {
@@ -169,22 +171,31 @@ export const useMaterialStore = defineStore('material', () => {
         grade: payload.grade,
         processMethod: payload.processMethod,
         aromaNote: payload.aromaNote.trim(),
-        createdAt: payload.createdAt
+        createdAt: payload.createdAt,
+        rev: INITIAL_MATERIAL_REV
       },
       'material'
     )
   }
 
-  async function updateMaterial(id: string, patch: Partial<Material>): Promise<void> {
-    await materialTable.update(id, patch)
+  /**
+   * 更新香料主档。等级/炮制变化时联动失效重算（未固化配比与未入窖批次快照），
+   * 已入窖批次锁住；expectedRev 与当前修订号不符时抛 MasterConflictError，由页面带草稿重试。
+   */
+  async function updateMaterial(
+    id: string,
+    patch: Partial<Material> & { expectedRev?: number }
+  ): Promise<MaterialCascadeResult> {
+    return updateMaterialWithCascade(id, patch)
   }
 
-  /** 更新炮制方式并同步到字典 */
-  async function setProcessMethod(id: string, processMethod: ProcessMethod): Promise<void> {
-    await materialTable.update(id, { processMethod })
+  /** 更新炮制方式（会推进修订号并联动重算）并同步到字典 */
+  async function setProcessMethod(id: string, processMethod: ProcessMethod): Promise<MaterialCascadeResult> {
+    const result = await updateMaterialWithCascade(id, { processMethod })
     if (!processMethodDictionary.value.includes(processMethod)) {
       processMethodDictionary.value = [...processMethodDictionary.value, processMethod]
     }
+    return result
   }
 
   /** 删除香料：同时级联删除引用它的配比记录（配比合计会因此变化） */

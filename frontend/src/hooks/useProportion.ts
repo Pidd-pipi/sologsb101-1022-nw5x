@@ -40,6 +40,10 @@ export interface ProportionRow {
   processMethod: ProcessMethod | '未知'
   ratio: number
   role: ProportionRole
+  /** 所引主档当前修订号（主档缺失时为 null） */
+  materialRev: number | null
+  /** 配比停在的主档写法是否已落后（跨页异常态提示用，正常联动后恒为最新） */
+  stale: boolean
 }
 
 export interface UseProportionResult {
@@ -55,7 +59,11 @@ export interface UseProportionResult {
   loading: Ref<boolean>
   error: Ref<string | null>
   add: (payload: ProportionFormPayload) => Promise<Proportion>
-  update: (id: string, patch: Partial<ProportionFormPayload>) => Promise<void>
+  update: (
+    id: string,
+    patch: Partial<ProportionFormPayload>,
+    options?: { expectedMaterialRev?: number }
+  ) => Promise<void>
   remove: (id: string) => Promise<void>
   /** 一键等比缩放到合计 100（可指定缩放因子） */
   rescale: (factor?: number) => Promise<number>
@@ -93,6 +101,7 @@ export function useProportion(options: UseProportionOptions = {}): UseProportion
     materialStore.materials.forEach((material) => materialMap.set(material.id, material))
     const list = proportionStore.proportionsByFormula(id).map<ProportionRow>((proportion) => {
       const material = materialMap.get(proportion.materialId) ?? null
+      const materialRev = typeof material?.rev === 'number' ? material.rev : null
       return {
         id: proportion.id,
         proportion,
@@ -102,7 +111,9 @@ export function useProportion(options: UseProportionOptions = {}): UseProportion
         grade: material?.grade ?? '未知',
         processMethod: material?.processMethod ?? '未知',
         ratio: proportion.ratio,
-        role: proportion.role
+        role: proportion.role,
+        materialRev,
+        stale: materialRev !== null && proportion.materialRev !== materialRev
       }
     })
     const orderedIds = [...list]
@@ -161,14 +172,19 @@ export function useProportion(options: UseProportionOptions = {}): UseProportion
     }
   }
 
-  async function update(id: string, patch: Partial<ProportionFormPayload>): Promise<void> {
+  async function update(
+    id: string,
+    patch: Partial<ProportionFormPayload>,
+    options?: { expectedMaterialRev?: number }
+  ): Promise<void> {
     loading.value = true
     try {
-      const next: Partial<Proportion> = {}
+      const next: Partial<Proportion> & { expectedMaterialRev?: number } = {}
       if (patch.materialId !== undefined) next.materialId = patch.materialId
       if (patch.ratio !== undefined) next.ratio = round(patch.ratio, 2)
       if (patch.role !== undefined) next.role = patch.role
       if (patch.note !== undefined) next.note = patch.note.trim()
+      if (options?.expectedMaterialRev !== undefined) next.expectedMaterialRev = options.expectedMaterialRev
       await proportionStore.updateProportion(id, next)
       await syncFormulaTotal()
     } catch (err) {

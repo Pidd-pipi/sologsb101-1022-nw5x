@@ -16,11 +16,19 @@ import {
   type ScentType,
   type UsageScene
 } from '@/types/formula'
-import { MATERIAL_GRADES, PROCESS_METHODS, type Material, type MaterialGrade, type ProcessMethod } from '@/types/material'
+import {
+  INITIAL_MATERIAL_REV,
+  MATERIAL_GRADES,
+  PROCESS_METHODS,
+  type Material,
+  type MaterialGrade,
+  type ProcessMethod
+} from '@/types/material'
 import { PROPORTION_ROLES, type Proportion, type ProportionRole } from '@/types/proportion'
 import { FORMING_METHODS, type Batch, type FormingMethod } from '@/types/batch'
 import { CELLAR_CONTAINERS, CELLAR_STATES, type Cellar, type CellarState, type CellarContainer } from '@/types/cellar'
 import type { Tasting } from '@/types/tasting'
+import { normalizeMaterialRev, normalizeSnapshotItem } from '@/utils/master'
 
 /** 单方香方导出文件结构：一个香方 + 其配比 + 派生批次、窖藏、品香 */
 export interface FormulaExportPayload {
@@ -213,6 +221,7 @@ function parseMaterial(raw: unknown, errors: string[], index: number): Material 
     processMethod: pickEnum<ProcessMethod>(raw.processMethod, PROCESS_METHOD_SET, '生用'),
     aromaNote: asString(raw.aromaNote),
     createdAt: asString(raw.createdAt, new Date().toISOString().slice(0, 10)),
+    rev: normalizeMaterialRev({ rev: asNumber(raw.rev, NaN) } as Partial<Material>),
     updatedAt: asNumber(raw.updatedAt, Date.now())
   }
 }
@@ -276,6 +285,7 @@ export function validateFormulaJson(input: unknown): ValidateResult<FormulaExpor
       ratio,
       role: raw.role as ProportionRole,
       note: asString(raw.note),
+      materialRev: asNumber(raw.materialRev, INITIAL_MATERIAL_REV),
       seq: asNumber(raw.seq, index + 1),
       updatedAt: asNumber(raw.updatedAt, Date.now())
     })
@@ -292,6 +302,7 @@ export function validateFormulaJson(input: unknown): ValidateResult<FormulaExpor
       errors.push(`batches[${index}] formingMethod 取值非法：${raw.formingMethod}`)
       return
     }
+    const rawSnapshot = Array.isArray(raw.snapshot) ? (raw.snapshot as unknown[]).filter(isRecord) : []
     batches.push({
       id: asString(raw.id, createId('batch')),
       formulaId: formula.id,
@@ -299,14 +310,12 @@ export function validateFormulaJson(input: unknown): ValidateResult<FormulaExpor
       formingMethod: pickEnum<FormingMethod>(raw.formingMethod, FORMING_SET, '挤条'),
       quantity: asNumber(raw.quantity, 0),
       operator: asString(raw.operator),
-      snapshot: Array.isArray(raw.snapshot)
-        ? (raw.snapshot as unknown[]).filter(isRecord).map((item) => ({
-            materialId: asString(item.materialId),
-            materialName: asString(item.materialName, '未知香料'),
-            ratio: asNumber(item.ratio, 0),
-            role: asString(item.role, '君')
-          }))
-        : [],
+      snapshot: rawSnapshot.map((item) => {
+        const materialId = asString((item as Record<string, unknown>).materialId)
+        // 导入文件里带主档时按主档当前写法规范化旧版（v2）快照；否则保留文件内写法
+        const material = materials.find((entry) => entry.id === materialId)
+        return normalizeSnapshotItem(item as Record<string, unknown>, material)
+      }),
       snapshotAt: asNumber(raw.snapshotAt, 0),
       updatedAt: asNumber(raw.updatedAt, Date.now())
     })
@@ -401,7 +410,29 @@ export function validateSnapshotJson(input: unknown): ValidateResult<IncenseSnap
     if (!Array.isArray(input[key])) errors.push(`${key} 字段缺失或不是数组`)
   })
   if (errors.length > 0) return { ok: false, errors, payload: null }
-  const snapshot = input as unknown as IncenseSnapshot
+  const raw = input as unknown as IncenseSnapshot
+  // 旧版本（v2 及以前）导出文件没有修订号：按当前值回填，保证入库后结构与 v3 一致
+  const materialById = new Map<string, Material>()
+  const materials = raw.materials.map((material) => {
+    const normalized: Material = { ...material, rev: normalizeMaterialRev(material) }
+    materialById.set(normalized.id, normalized)
+    return normalized
+  })
+  const snapshot: IncenseSnapshot = {
+    ...raw,
+    materials,
+    proportions: raw.proportions.map((proportion) => ({
+      ...proportion,
+      materialRev:
+        typeof proportion.materialRev === 'number'
+          ? proportion.materialRev
+          : materialById.get(proportion.materialId)?.rev ?? INITIAL_MATERIAL_REV
+    })),
+    batches: raw.batches.map((batch) => ({
+      ...batch,
+      snapshot: (batch.snapshot ?? []).map((item) => normalizeSnapshotItem(item, materialById.get(item.materialId)))
+    }))
+  }
   return { ok: true, errors: [], payload: snapshot }
 }
 

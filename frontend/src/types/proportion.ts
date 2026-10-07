@@ -13,6 +13,11 @@ export interface Proportion {
   role: ProportionRole
   /** 备注：炮制要点、替代香材等 */
   note: string
+  /**
+   * 所引用主档的修订号：香料改等级/炮制时，未固化配比会被一并推进到最新 rev，
+   * 因此该值与 Material.rev 一致即代表配比停在最新主档写法上；保存时用于乐观并发冲突检测。
+   */
+  materialRev: number
   /** 君臣佐使编排顺序（拖拽排序回写） */
   seq: number
   updatedAt: number
@@ -68,6 +73,7 @@ export interface ProportionDraft {
   ratio: number
   role: ProportionRole
   note: string
+  materialRev: number
   seq: number
 }
 

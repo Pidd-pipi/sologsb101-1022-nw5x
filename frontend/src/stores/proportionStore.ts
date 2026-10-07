@@ -10,7 +10,9 @@ import {
   type ProportionRole,
   type RatioCheck
 } from '@/types/proportion'
+import { INITIAL_MATERIAL_REV } from '@/types/material'
 import { checkRatioTotal, round, sortByRoleWeight, sumRatios } from '@/utils/ratio'
+import { assertMaterialAtRev } from '@/utils/master'
 
 /** 当前配比草稿行的校验结果 */
 export interface ProportionDraftCheck {
@@ -28,6 +30,10 @@ export const useProportionStore = defineStore('proportion', () => {
   const proportionTable = useIdbTable<Proportion>((database) => database.proportions, {
     sortByUpdatedAt: false
   })
+  const materialTable = useIdbTable<import('@/types/material').Material>(
+    (database) => database.materials,
+    { sortByUpdatedAt: false }
+  )
 
   const prefs = readUiPrefs()
   const sortMode = ref<'manual' | 'role'>(prefs.proportionSort)
@@ -71,6 +77,29 @@ export const useProportionStore = defineStore('proportion', () => {
     })
     return map
   })
+
+  /** 香料 id → 当前主档修订号 */
+  const materialRevMap = computed<Record<string, number>>(() => {
+    const map: Record<string, number> = {}
+    materialTable.rows.value.forEach((material) => {
+      map[material.id] = material.rev
+    })
+    return map
+  })
+
+  /** 停在旧主档写法上的配比 id（正常情况下级联会即时推进，此集合用于跨页异常态提示） */
+  const staleProportionIds = computed<Set<string>>(() => {
+    const stale = new Set<string>()
+    proportions.value.forEach((proportion) => {
+      const latest = materialRevMap.value[proportion.materialId]
+      if (typeof latest === 'number' && proportion.materialRev !== latest) stale.add(proportion.id)
+    })
+    return stale
+  })
+
+  function isStale(id: string): boolean {
+    return staleProportionIds.value.has(id)
+  }
 
   const roleCounts = computed<Record<ProportionRole, number>>(() => {
     const counts: Record<ProportionRole, number> = { 君: 0, 臣: 0, 佐: 0, 使: 0 }
@@ -179,6 +208,8 @@ export const useProportionStore = defineStore('proportion', () => {
   }): Promise<Proportion> {
     const list = proportionsByFormula(payload.formulaId)
     try {
+      const material = materialTable.rows.value.find((item) => item.id === payload.materialId)
+      const materialRev = typeof material?.rev === 'number' ? material.rev : INITIAL_MATERIAL_REV
       return await proportionTable.create(
         {
           formulaId: payload.formulaId,
@@ -186,6 +217,7 @@ export const useProportionStore = defineStore('proportion', () => {
           ratio: round(payload.ratio, 2),
           role: payload.role,
           note: payload.note,
+          materialRev,
           seq: payload.seq ?? (list.length === 0 ? 1 : Math.max(...list.map((item) => item.seq)) + 1)
         },
         'prop'
@@ -196,8 +228,23 @@ export const useProportionStore = defineStore('proportion', () => {
     }
   }
 
-  async function updateProportion(id: string, patch: Partial<Proportion>): Promise<void> {
-    await proportionTable.update(id, patch)
+  /**
+   * 更新配比。更换香料时按 expectedMaterialRev 做乐观并发校验：
+   * 表单打开后该香料主档若已被别处升版，抛 MasterConflictError，页面保留草稿并带最新修订号重试。
+   */
+  async function updateProportion(
+    id: string,
+    patch: Partial<Proportion> & { expectedMaterialRev?: number }
+  ): Promise<void> {
+    const { expectedMaterialRev, ...fields } = patch
+    if (fields.materialId !== undefined && expectedMaterialRev !== undefined) {
+      await assertMaterialAtRev(fields.materialId, expectedMaterialRev)
+    }
+    if (fields.materialId !== undefined) {
+      const material = await db.materials.get(fields.materialId)
+      fields.materialRev = material?.rev ?? INITIAL_MATERIAL_REV
+    }
+    await proportionTable.update(id, fields)
   }
 
   async function removeProportion(id: string): Promise<void> {
@@ -231,6 +278,8 @@ export const useProportionStore = defineStore('proportion', () => {
     proportionsByFormulaMap,
     materialCountMap,
     totalByFormula,
+    materialRevMap,
+    staleProportionIds,
     roleCounts,
     draft,
     draftCheck,
@@ -246,6 +295,7 @@ export const useProportionStore = defineStore('proportion', () => {
     checkFormula,
     checkDraft,
     validateDrafts,
+    isStale,
     patchFilter,
     resetFilter,
     setDraft,

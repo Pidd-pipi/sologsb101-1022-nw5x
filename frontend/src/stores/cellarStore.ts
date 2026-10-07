@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
-import { db, readUiPrefs, writeUiPrefs } from '@/utils/db'
+import { db, createId, readUiPrefs, writeUiPrefs } from '@/utils/db'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import {
   CELLAR_NEAR_DAYS,
@@ -16,6 +16,7 @@ import {
 import type { Batch } from '@/types/batch'
 import type { Formula } from '@/types/formula'
 import { round } from '@/utils/ratio'
+import { stampSnapshotOnCellar, resyncSnapshotToMaster } from '@/utils/master'
 
 /** 一天的毫秒数 */
 const DAY_MS = 24 * 60 * 60 * 1000
@@ -218,24 +219,42 @@ export const useCellarStore = defineStore('cellar', () => {
     container: CellarContainer
     state?: CellarState
   }): Promise<Cellar> {
-    return cellarTable.create(
-      {
-        batchId: payload.batchId,
-        startDate: payload.startDate,
-        endDate: payload.endDate,
-        temperatureC: round(payload.temperatureC, 1),
-        humidityPct: round(payload.humidityPct, 1),
-        container: payload.container,
-        state: payload.state ?? '窖藏中'
-      },
-      'cellar'
-    )
+    const now = Date.now()
+    const cellar: Cellar = {
+      id: createId('cellar'),
+      batchId: payload.batchId,
+      startDate: payload.startDate,
+      endDate: payload.endDate,
+      temperatureC: round(payload.temperatureC, 1),
+      humidityPct: round(payload.humidityPct, 1),
+      container: payload.container,
+      state: payload.state ?? '窖藏中',
+      updatedAt: now
+    }
+    // 入窖即冻结：先把批次快照刷新到最新主档写法（占比/角色保持和香当时值），
+    // 窖藏记录落库后该批次进入锁定集合，后续主档改动不再联动它。
+    await db.transaction('rw', [db.cellars, db.batches, db.materials], async () => {
+      await stampSnapshotOnCellar(payload.batchId)
+      await db.cellars.put(cellar)
+    })
+    return cellar
   }
 
   async function updateCellar(id: string, patch: Partial<Cellar>): Promise<void> {
     const next: Partial<Cellar> = { ...patch }
     if (patch.temperatureC !== undefined) next.temperatureC = round(patch.temperatureC, 1)
     if (patch.humidityPct !== undefined) next.humidityPct = round(patch.humidityPct, 1)
+    if (patch.batchId !== undefined) {
+      const current = cellarById(id)
+      if (current && current.batchId !== patch.batchId) {
+        // 改关联到新批次：该批次即刻进入锁定集合，先刷快照到最新主档再落库
+        await db.transaction('rw', [db.cellars, db.batches, db.materials], async () => {
+          await stampSnapshotOnCellar(patch.batchId as string)
+          await db.cellars.update(id, { ...next, updatedAt: Date.now() })
+        })
+        return
+      }
+    }
     await cellarTable.update(id, next)
   }
 
@@ -270,8 +289,14 @@ export const useCellarStore = defineStore('cellar', () => {
   }
 
   async function removeCellar(id: string): Promise<void> {
+    const cellar = cellarById(id)
     await cellarTable.remove(id)
     if (currentCellarId.value === id) currentCellarId.value = null
+    // 该批次若已无任何窖藏记录（直接查库，避免响应式缓存未刷新误判），快照解除锁定并重新对齐最新主档
+    if (cellar) {
+      const remain = await db.cellars.where('batchId').equals(cellar.batchId).count()
+      if (remain === 0) await resyncSnapshotToMaster(cellar.batchId)
+    }
   }
 
   async function removeCellarsOfBatch(batchId: string): Promise<number> {
