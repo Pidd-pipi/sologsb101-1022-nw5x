@@ -112,21 +112,28 @@ sologsb101-1022/
 ## 五、IndexedDB 库名与数据存储说明
 
 - **库名**：`gbincense`（`frontend/src/utils/db.ts` 中的 `new IncenseDatabase()` → `super('gbincense')`）。
-- **结构版本号**：`export const DB_VERSION = 2`，同时写入 localStorage 键 `gbincense:db-version` 便于比对。
+- **结构版本号**：`export const DB_VERSION = 3`，同时写入 localStorage 键 `gbincense:db-version` 便于比对。
 
 | 表 | 主键与索引 | 说明 |
 | --- | --- | --- |
 | `formulas` | `id, name, scentType, usage, state, createdAt, totalRatio, updatedAt` | 香方主档，`totalRatio` 由配比页实时回写 |
-| `materials` | `id, name, origin, grade, processMethod, updatedAt` | 香料库与炮制方式 |
-| `proportions` | `id, formulaId, materialId, role, seq, updatedAt` | 君臣佐使配比，`seq` 为拖拽编排顺序 |
-| `batches` | `id, formulaId, mixedAt, formingMethod, updatedAt` | 和香批次，含 `snapshot` 配比快照 |
+| `materials` | `id, name, origin, grade, processMethod, revision, updatedAt` | 香料库与炮制方式；`revision` 为主档修订号，改等级 / 炮制 +1 |
+| `proportions` | `id, formulaId, materialId, role, seq, updatedAt` | 君臣佐使配比，`seq` 为拖拽编排顺序，`materialRevision` 绑定主档修订号 |
+| `batches` | `id, formulaId, mixedAt, formingMethod, locked, updatedAt` | 和香批次，含 `snapshot` 配比快照与 `locked / lockedAt` 入窖锁定标记 |
 | `cellars` | `id, batchId, startDate, endDate, state, updatedAt` | 窖藏批次与环境读数 |
 | `tastings` | `id, batchId, tastedAt, smokeScore, updatedAt` | 品香评鉴 |
 
-- **版本迁移**：`version(1).stores({...})` 为初版结构；`version(DB_VERSION).stores({...}).upgrade(async (tx) => {...})` 为真实迁移，会 `toCollection().modify(...)` 改写历史数据：
+- **版本迁移**：`version(1).stores({...})` 为初版结构；`version(2)` 补齐配比 `seq`、批次快照与品香留香；`version(DB_VERSION)`（v3）回填修订号与入窖锁定，会 `toCollection().modify(...)` 改写历史数据：
   1. 配比表补齐 `seq`（按 `formulaId` 分组顺序编号）与 `updatedAt`；
   2. 批次表补齐 `snapshot` 数组与 `snapshotAt`；
-  3. 品香表补齐 `lastingMin` 默认值。
+  3. 品香表补齐 `lastingMin` 默认值；
+  4. v3：香料按当前值回填 `revision=1`、配比回填 `materialRevision=1`；**已有窖藏记录的批次在升级当刻锁定**（按当时配比 + 当前主档补齐快照里的等级 / 炮制写法与修订号），未入窖批次按当前配比与最新主档整体重算。
+- **主档一致性（v3，`utils/master.ts` 纯逻辑 + `utils/masterSync.ts` 事务）**：香料主档、配比、批次快照与品鉴档案共用同一份主档。
+  - 改香料 **等级 / 炮制方式** 时主档 `revision` +1（只改名称 / 产地 / 香气特征不抬修订号）；同一事务内把引用它的 **未入窖批次快照** 失效重算（按当前配比 + 最新主档重固化等级 / 炮制写法），**已入窖批次锁住当时写法不动**。
+  - **未固化配比** 永远按最新主档渲染（等级 / 炮制实时取主档），行上的 `materialRevision` 落后时标「主档已更新 vN」，保存即对齐。
+  - **入窖即锁定**：登记窖藏在同一事务把批次快照按当时配比 + 最新主档固化并置 `locked=true`；品鉴档案与导出 JSON 随快照走（未入窖=最新写法，已入窖=入窖当时写法）。删除全部窖藏记录后解锁并按最新主档重算。
+  - **多页面并发**：Dexie `liveQuery` 跨标签页推送，另一开着的页面按最新主档重算；配比保存带 `baseMaterialRevision` 做乐观并发校验，主档被别处改动时返回 `MasterConflictError`，弹窗保留草稿并展示最新等级 / 炮制，点「按最新主档重试」带着草稿重新保存。
+  - 导入旧版本 JSON（无修订号）时按当前值回填；有窖藏的批次按已入窖锁定，未入窖批次按当前配比 + 主档重算快照写法。
 - **首屏自动播种**：`main.ts` 在挂载前调用 `initDatabase()`，其中包含 `if ((await db.formulas.count()) === 0) { await seedDatabase() }`，写入 3 款香方 → 7 条配比 / 2 个和香批次 → 2 条窖藏 / 2 条品香（香方 → 配比/批次 → 窖藏/品香 三层互相引用）。播种使用固定 id + `bulkPut`，**幂等**，重复调用不会产生重复数据。
 - **localStorage 元数据**：`gbincense:db-version`（结构版本）、`gbincense:last-backup-at`（上次导出时间）、`gbincense:ui-prefs`（当前香方、配比与窖藏排序方式）。
 - **导出 / 导入**：`utils/export.ts` 提供 `exportFormulaJson()`（单方）与 `exportSnapshotJson()`（全量），导入前用 `validateFormulaJson()` / `validateSnapshotJson()` 做字段与枚举校验，校验失败会提示具体错误且不写库。

@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
-import { db, readUiPrefs, writeUiPrefs } from '@/utils/db'
+import { db, createId, readUiPrefs, writeUiPrefs } from '@/utils/db'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import {
   CELLAR_NEAR_DAYS,
@@ -16,6 +16,7 @@ import {
 import type { Batch } from '@/types/batch'
 import type { Formula } from '@/types/formula'
 import { round } from '@/utils/ratio'
+import { lockBatchSnapshot, unlockBatchSnapshot } from '@/utils/masterSync'
 
 /** 一天的毫秒数 */
 const DAY_MS = 24 * 60 * 60 * 1000
@@ -218,24 +219,44 @@ export const useCellarStore = defineStore('cellar', () => {
     container: CellarContainer
     state?: CellarState
   }): Promise<Cellar> {
-    return cellarTable.create(
-      {
-        batchId: payload.batchId,
-        startDate: payload.startDate,
-        endDate: payload.endDate,
-        temperatureC: round(payload.temperatureC, 1),
-        humidityPct: round(payload.humidityPct, 1),
-        container: payload.container,
-        state: payload.state ?? '窖藏中'
-      },
-      'cellar'
-    )
+    // 入窖登记与快照锁定放在同一事务：入窖即锁住当时等级 / 炮制写法
+    const now = Date.now()
+    const record: Cellar = {
+      id: createId('cellar'),
+      batchId: payload.batchId,
+      startDate: payload.startDate,
+      endDate: payload.endDate,
+      temperatureC: round(payload.temperatureC, 1),
+      humidityPct: round(payload.humidityPct, 1),
+      container: payload.container,
+      state: payload.state ?? '窖藏中',
+      updatedAt: now
+    }
+    await db.transaction('rw', [db.cellars, db.batches, db.proportions, db.materials], async () => {
+      await db.cellars.put(record)
+      await lockBatchSnapshot(payload.batchId)
+    })
+    return record
   }
 
   async function updateCellar(id: string, patch: Partial<Cellar>): Promise<void> {
     const next: Partial<Cellar> = { ...patch }
     if (patch.temperatureC !== undefined) next.temperatureC = round(patch.temperatureC, 1)
     if (patch.humidityPct !== undefined) next.humidityPct = round(patch.humidityPct, 1)
+    const previous = patch.batchId !== undefined ? cellarById(id) : undefined
+    if (previous && previous.batchId !== patch.batchId) {
+      // 改挂批次：新批次入窖锁定，旧批次解锁回到随主档重算
+      await db.transaction(
+        'rw',
+        [db.cellars, db.batches, db.proportions, db.materials],
+        async () => {
+          await cellarTable.update(id, next)
+          await lockBatchSnapshot(patch.batchId as string)
+          await unlockBatchSnapshot(previous.batchId)
+        }
+      )
+      return
+    }
     await cellarTable.update(id, next)
   }
 
@@ -270,14 +291,18 @@ export const useCellarStore = defineStore('cellar', () => {
   }
 
   async function removeCellar(id: string): Promise<void> {
+    const cellar = cellarById(id)
     await cellarTable.remove(id)
     if (currentCellarId.value === id) currentCellarId.value = null
+    // 该批次已无窖藏记录：解锁并按最新主档重算快照
+    if (cellar) await unlockBatchSnapshot(cellar.batchId)
   }
 
   async function removeCellarsOfBatch(batchId: string): Promise<number> {
     const ids = cellarsOfBatch(batchId).map((cellar) => cellar.id)
     if (ids.length === 0) return 0
     await cellarTable.bulkRemove(ids)
+    await unlockBatchSnapshot(batchId)
     return ids.length
   }
 

@@ -62,6 +62,8 @@ export interface TastingRow {
   formulaId: string | null
   formulaName: string
   formingMethod: string
+  /** 所属批次是否已入窖锁定（锁定后档案保留当时写法） */
+  batchLocked: boolean
 }
 
 /** 某香方的品香均分聚合结果 */

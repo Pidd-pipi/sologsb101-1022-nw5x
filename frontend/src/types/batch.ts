@@ -7,6 +7,14 @@ export interface BatchSnapshotItem {
   materialName: string
   ratio: number
   role: string
+  /**
+   * 固化当时的等级 / 炮制写法：已入窖批次锁定当时写法，
+   * 未入窖批次会随主档修订自动失效重算。
+   */
+  grade: string
+  processMethod: string
+  /** 该条快照依据的香料主档修订号 */
+  materialRevision: number
 }
 
 export interface Batch {
@@ -25,6 +33,10 @@ export interface Batch {
   snapshot: BatchSnapshotItem[]
   /** 快照固化时间戳 */
   snapshotAt: number
+  /** 是否已入窖锁定：锁定后主档再改也不重算快照，保留当时写法 */
+  locked: boolean
+  /** 入窖锁定时间戳（0 表示尚未锁定） */
+  lockedAt: number
   updatedAt: number
 }
 
@@ -43,6 +55,11 @@ export interface BatchRow {
   /** 是否已进入窖藏 */
   cellared: boolean
   cellarState: string
+  /**
+   * 快照里停在旧主档写法的味数（等级 / 炮制被改过）。
+   * 未入窖的批次会自动重算；已入窖锁定后该值保留，提示「当时写法」。
+   */
+  staleMaterialCount: number
 }
 
 /** 批次筛选条件 */

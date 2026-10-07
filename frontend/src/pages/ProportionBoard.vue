@@ -14,6 +14,7 @@ import { useProportion, type ProportionRow } from '@/hooks/useProportion'
 import { PROPORTION_ROLES, ROLE_COLOR, ROLE_HINT, type ProportionRole } from '@/types/proportion'
 import { MATERIAL_GRADES } from '@/types/material'
 import { formatPercent, round } from '@/utils/ratio'
+import { isMasterConflictError, revisionOf, type MasterConflictError as MasterConflict } from '@/utils/master'
 
 const route = useRoute()
 const router = useRouter()
@@ -29,6 +30,10 @@ const editingId = ref<string | null>(null)
 const formRef = ref<FormInstance>()
 const draggingId = ref<string | null>(null)
 const dragOverId = ref<string | null>(null)
+/** 表单打开时香料主档的修订号，保存时做乐观并发校验 */
+const baseRevision = ref<number | null>(null)
+/** 另一页面先改了主档导致保存冲突时的最新主档信息，弹窗保留草稿供重试 */
+const conflict = ref<MasterConflict | null>(null)
 
 const form = reactive<{
   materialId: string
@@ -202,6 +207,8 @@ function openCreate(): void {
   form.ratio = 10
   form.role = '君'
   form.note = ''
+  conflict.value = null
+  baseRevision.value = revisionOf(materialStore.materialById(form.materialId))
   dialogVisible.value = true
 }
 
@@ -211,7 +218,23 @@ function openEdit(row: ProportionRow): void {
   form.ratio = row.ratio
   form.role = row.role
   form.note = row.proportion.note
+  conflict.value = null
+  baseRevision.value = revisionOf(materialStore.materialById(row.proportion.materialId))
   dialogVisible.value = true
+}
+
+/** 表单当前所选香料的最新主档（供冲突提示与重试前展示） */
+const selectedMaterial = computed(() => materialStore.materialById(form.materialId) ?? null)
+
+/** 主档在表单打开后被别处改动：表单所见版本落后于最新主档 */
+const formMasterStale = computed(() => {
+  if (baseRevision.value === null || !selectedMaterial.value) return false
+  return baseRevision.value !== revisionOf(selectedMaterial.value)
+})
+
+function syncBaseRevision(): void {
+  baseRevision.value = revisionOf(materialStore.materialById(form.materialId))
+  conflict.value = null
 }
 
 async function submitForm(): Promise<void> {
@@ -221,18 +244,38 @@ async function submitForm(): Promise<void> {
   submitting.value = true
   try {
     if (editingId.value) {
-      await update(editingId.value, {
+      await update(
+        editingId.value,
+        {
+          materialId: form.materialId,
+          ratio: form.ratio,
+          role: form.role,
+          note: form.note,
+          baseMaterialRevision: baseRevision.value ?? undefined
+        }
+      )
+      ElMessage.success('配比已更新，已按最新主档对齐')
+    } else {
+      await add({
         materialId: form.materialId,
         ratio: form.ratio,
         role: form.role,
-        note: form.note
+        note: form.note,
+        baseMaterialRevision: baseRevision.value ?? undefined
       })
-      ElMessage.success('配比已更新')
-    } else {
-      await add({ materialId: form.materialId, ratio: form.ratio, role: form.role, note: form.note })
       ElMessage.success('已加入配比，可继续调整占比')
     }
+    conflict.value = null
     dialogVisible.value = false
+  } catch (err) {
+    if (isMasterConflictError(err)) {
+      // 另一开着的页面已经改了主档：保留当前草稿，按最新主档重算视图，确认后可带着草稿重试
+      conflict.value = err
+      baseRevision.value = err.actualRevision
+      ElMessage.warning(`主档已在另一页面更新到 v${err.actualRevision}，草稿已保留，请按最新等级 / 炮制确认后重试`)
+    } else {
+      throw err
+    }
   } finally {
     submitting.value = false
   }
@@ -455,6 +498,13 @@ const roleColor = (role: ProportionRole): string => ROLE_COLOR[role]
             <strong>{{ row.materialName }}</strong>
             <span class="drag-row__sub muted">{{ row.origin }} · {{ row.processMethod }}</span>
             <GradeTag v-if="row.grade !== '未知'" :grade="row.grade" plain size="small" />
+            <el-tooltip
+              v-if="row.stale"
+              content="主档等级 / 炮制已改，这行配比停在旧写法；保存即对齐到最新主档"
+              placement="top"
+            >
+              <el-tag size="small" type="warning" effect="dark" round>主档已更新 v{{ row.currentRevision }}</el-tag>
+            </el-tooltip>
           </span>
           <span class="drag-row__role">
             <el-tag :style="{ backgroundColor: roleColor(row.role), color: '#fff', borderColor: roleColor(row.role) }" round>
@@ -492,9 +542,42 @@ const roleColor = (role: ProportionRole): string => ROLE_COLOR[role]
     </div>
 
     <el-dialog v-model="dialogVisible" :title="editingId ? '编辑配比' : '新增配比'" width="560px" append-to-body>
+      <el-alert
+        v-if="conflict"
+        class="conflict-alert"
+        type="warning"
+        show-icon
+        :closable="false"
+        title="另一开着的页面已改动该香料主档，本次保存基于旧修订号"
+      >
+        <template #default>
+          <div class="conflict-body">
+            <div v-if="conflict.latest">
+              最新主档：{{ conflict.latest.name }} ·
+              <GradeTag :grade="conflict.latest.grade" plain size="small" />
+              · {{ conflict.latest.processMethod }} · v{{ conflict.actualRevision }}
+            </div>
+            <div class="muted">草稿（占比 / 君臣佐使 / 备注）已保留，确认最新写法后点「按最新主档重试」即可。</div>
+          </div>
+        </template>
+      </el-alert>
+      <el-alert
+        v-else-if="formMasterStale && selectedMaterial"
+        class="conflict-alert"
+        type="info"
+        show-icon
+        :closable="false"
+        :title="`主档已更新到 v${revisionOf(selectedMaterial)}：${selectedMaterial.grade} / ${selectedMaterial.processMethod}，保存将按最新主档对齐`"
+      />
       <el-form ref="formRef" :model="form" :rules="rules" label-width="104px">
         <el-form-item label="香料" prop="materialId">
-          <el-select v-model="form.materialId" filterable placeholder="选择香料" style="width: 100%">
+          <el-select
+            v-model="form.materialId"
+            filterable
+            placeholder="选择香料"
+            style="width: 100%"
+            @update:model-value="syncBaseRevision"
+          >
             <el-option v-for="item in materialOptions" :key="item.value" :label="item.label" :value="item.value" />
           </el-select>
         </el-form-item>
@@ -516,7 +599,7 @@ const roleColor = (role: ProportionRole): string => ROLE_COLOR[role]
       <template #footer>
         <el-button @click="dialogVisible = false">取消</el-button>
         <el-button type="primary" :loading="submitting" @click="submitForm">
-          {{ editingId ? '保存修改' : '加入配比' }}
+          {{ conflict ? '按最新主档重试' : editingId ? '保存修改' : '加入配比' }}
         </el-button>
       </template>
     </el-dialog>
@@ -626,5 +709,17 @@ const roleColor = (role: ProportionRole): string => ROLE_COLOR[role]
 .form-hint {
   margin-left: 10px;
   font-size: 12px;
+}
+
+.conflict-alert {
+  margin-bottom: 14px;
+}
+
+.conflict-body {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  line-height: 1.6;
 }
 </style>

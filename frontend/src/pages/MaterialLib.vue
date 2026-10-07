@@ -163,7 +163,7 @@ async function submitForm(): Promise<void> {
   submitting.value = true
   try {
     if (editingId.value) {
-      await materialStore.updateMaterial(editingId.value, {
+      const result = await materialStore.updateMaterial(editingId.value, {
         name: form.name.trim(),
         origin: form.origin.trim(),
         grade: form.grade,
@@ -171,7 +171,13 @@ async function submitForm(): Promise<void> {
         aromaNote: form.aromaNote.trim(),
         createdAt: form.createdAt
       })
-      ElMessage.success('香料信息已更新')
+      if (result.writingChanged) {
+        ElMessage.success(
+          `香料信息已更新（修订号升至 v${result.revision}），${result.recalcedBatches} 个未入窖批次快照已按最新主档重算；已入窖批次保留当时写法`
+        )
+      } else {
+        ElMessage.success('香料信息已更新')
+      }
     } else {
       await materialStore.createMaterial({
         name: form.name,
@@ -191,8 +197,10 @@ async function submitForm(): Promise<void> {
 
 async function changeProcess(row: MaterialRow, method: ProcessMethod): Promise<void> {
   if (row.material.processMethod === method) return
-  await materialStore.setProcessMethod(row.material.id, method)
-  ElMessage.success(`「${row.material.name}」炮制方式已改为「${method}」`)
+  const result = await materialStore.setProcessMethod(row.material.id, method)
+  ElMessage.success(
+    `「${row.material.name}」炮制方式已改为「${method}」（修订号 v${result.revision}），${result.recalcedBatches} 个未入窖批次快照已重算`
+  )
 }
 
 async function removeMaterial(row: MaterialRow): Promise<void> {
@@ -207,7 +215,9 @@ async function removeMaterial(row: MaterialRow): Promise<void> {
   }).catch(() => false)
   if (!confirmed) return
   const result = await materialStore.removeMaterial(row.material.id)
-  ElMessage.success(`已删除香料，连带清除配比 ${result.proportions} 条`)
+  ElMessage.success(
+    `已删除香料，连带清除配比 ${result.proportions} 条，${result.recalcedBatches} 个未入窖批次快照已重算`
+  )
 }
 
 async function removeUnused(): Promise<void> {
@@ -301,6 +311,11 @@ function consumedBy(row: MaterialRow): string {
             >
               <el-option v-for="item in PROCESS_METHODS" :key="item" :label="item" :value="item" />
             </el-select>
+          </template>
+        </el-table-column>
+        <el-table-column label="主档版本" width="100">
+          <template #default="{ row }: { row: MaterialRow }">
+            <el-tag size="small" effect="plain" type="info" round>v{{ row.material.revision }}</el-tag>
           </template>
         </el-table-column>
         <el-table-column label="引用香方" min-width="200">

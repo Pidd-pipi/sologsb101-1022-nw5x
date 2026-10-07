@@ -5,6 +5,7 @@ import { useFormulaStore } from '@/stores/formulaStore'
 import { useMaterialStore } from '@/stores/materialStore'
 import type { Proportion, ProportionRole } from '@/types/proportion'
 import type { Material, MaterialGrade, ProcessMethod } from '@/types/material'
+import { revisionOf } from '@/utils/master'
 import {
   applyManualOrder,
   checkRatioTotal,
@@ -26,6 +27,8 @@ export interface ProportionFormPayload {
   ratio: number
   role: ProportionRole
   note: string
+  /** 表单打开时看到的主档修订号：与最新主档不一致则保存冲突，保留草稿重试 */
+  baseMaterialRevision?: number
 }
 
 /** 配比页一行：配比 + 香料快照 */
@@ -40,6 +43,12 @@ export interface ProportionRow {
   processMethod: ProcessMethod | '未知'
   ratio: number
   role: ProportionRole
+  /** 配比行绑定的主档修订号 */
+  materialRevision: number
+  /** 主档当前修订号 */
+  currentRevision: number
+  /** 主档是否已在别处改过等级 / 炮制（这行配比停在旧写法上） */
+  stale: boolean
 }
 
 export interface UseProportionResult {
@@ -93,6 +102,11 @@ export function useProportion(options: UseProportionOptions = {}): UseProportion
     materialStore.materials.forEach((material) => materialMap.set(material.id, material))
     const list = proportionStore.proportionsByFormula(id).map<ProportionRow>((proportion) => {
       const material = materialMap.get(proportion.materialId) ?? null
+      const currentRevision = revisionOf(material)
+      const materialRevision =
+        Number.isFinite(proportion.materialRevision) && proportion.materialRevision > 0
+          ? proportion.materialRevision
+          : currentRevision
       return {
         id: proportion.id,
         proportion,
@@ -102,7 +116,11 @@ export function useProportion(options: UseProportionOptions = {}): UseProportion
         grade: material?.grade ?? '未知',
         processMethod: material?.processMethod ?? '未知',
         ratio: proportion.ratio,
-        role: proportion.role
+        role: proportion.role,
+        materialRevision,
+        currentRevision,
+        // 未固化配比永远按最新主档渲染；修订号落后只用于提示这行停在旧写法
+        stale: material !== null && materialRevision !== currentRevision
       }
     })
     const orderedIds = [...list]
@@ -149,7 +167,8 @@ export function useProportion(options: UseProportionOptions = {}): UseProportion
         ratio: round(payload.ratio, 2),
         role: payload.role,
         note: payload.note.trim(),
-        seq: nextSeq(id)
+        seq: nextSeq(id),
+        baseMaterialRevision: payload.baseMaterialRevision
       })
       await syncFormulaTotal()
       return record
@@ -169,7 +188,8 @@ export function useProportion(options: UseProportionOptions = {}): UseProportion
       if (patch.ratio !== undefined) next.ratio = round(patch.ratio, 2)
       if (patch.role !== undefined) next.role = patch.role
       if (patch.note !== undefined) next.note = patch.note.trim()
-      await proportionStore.updateProportion(id, next)
+      // 带修订号的保存做乐观并发校验；只改占比 / 备注的就地编辑不传，直接跟随最新主档
+      await proportionStore.updateProportion(id, next, patch.baseMaterialRevision)
       await syncFormulaTotal()
     } catch (err) {
       error.value = err instanceof Error ? err.message : '更新配比失败'

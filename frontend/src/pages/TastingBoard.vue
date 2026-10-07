@@ -181,7 +181,8 @@ const rows = computed<TastingRow[]>(() =>
       batchLabel: batch ? `${batch.mixedAt} · ${batch.formingMethod} · ${batch.quantity} 支` : '批次已删除',
       formulaId: batch?.formulaId ?? null,
       formulaName: batch ? formulaStore.formulaName(batch.formulaId) : '香方已删除',
-      formingMethod: batch?.formingMethod ?? '—'
+      formingMethod: batch?.formingMethod ?? '—',
+      batchLocked: batch?.locked ?? false
     }
   })
 )
@@ -432,7 +433,7 @@ function onlyFormula(formulaId: string): void {
     <div class="section-card">
       <div class="section-card__head">
         <h3>香方品香均分（同批次多次评鉴取均分回写香方列表）</h3>
-        <span class="muted">导出文件包含香方、香料、配比、批次、窖藏与品香全部数据</span>
+        <span class="muted">导出含全部数据：未入窖批次随最新主档写法，已入窖批次锁定入窖当时写法（含修订号）</span>
       </div>
       <div v-if="aggregates.length === 0" class="muted">暂无品香评鉴数据，录入第一条后这里会显示均分。</div>
       <el-table v-else :data="aggregates" size="small" row-key="formulaId">
@@ -491,10 +492,13 @@ function onlyFormula(formulaId: string): void {
       </div>
 
       <el-table v-else :data="filteredRows" row-key="tasting.id" stripe>
-        <el-table-column label="香方 / 批次" min-width="200">
+        <el-table-column label="香方 / 批次" min-width="220">
           <template #default="{ row }: { row: TastingRow }">
             <div class="cell-main">{{ row.formulaName }}</div>
             <div class="cell-sub muted">{{ row.batchLabel }}</div>
+            <el-tag v-if="row.batchLocked" size="small" type="success" effect="plain" round>
+              批次已入窖 · 档案保留当时等级 / 炮制
+            </el-tag>
           </template>
         </el-table-column>
         <el-table-column label="品鉴日期" prop="tasting.tastedAt" width="120" />

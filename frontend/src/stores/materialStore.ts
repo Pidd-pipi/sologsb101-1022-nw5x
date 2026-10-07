@@ -1,16 +1,17 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
-import { db } from '@/utils/db'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import {
   createEmptyMaterialFilter,
   GRADE_WEIGHT,
+  INITIAL_MATERIAL_REVISION,
   type Material,
   type MaterialFilterState,
   type MaterialGrade,
   type ProcessMethod
 } from '@/types/material'
 import type { Proportion, ProportionRole } from '@/types/proportion'
+import { applyMaterialRemoval, applyMaterialUpdate } from '@/utils/masterSync'
 
 /** 香料库一行：香料 + 被引用情况 */
 export interface MaterialRow {
@@ -169,36 +170,44 @@ export const useMaterialStore = defineStore('material', () => {
         grade: payload.grade,
         processMethod: payload.processMethod,
         aromaNote: payload.aromaNote.trim(),
-        createdAt: payload.createdAt
+        createdAt: payload.createdAt,
+        revision: INITIAL_MATERIAL_REVISION
       },
       'material'
     )
   }
 
-  async function updateMaterial(id: string, patch: Partial<Material>): Promise<void> {
-    await materialTable.update(id, patch)
+  /**
+   * 更新香料主档。改等级 / 炮制时由主档服务抬修订号，
+   * 并让引用它的未入窖批次快照失效重算（已入窖批次锁住当时写法）。
+   */
+  async function updateMaterial(
+    id: string,
+    patch: Partial<Material>
+  ): Promise<{ revision: number; writingChanged: boolean; recalcedBatches: number }> {
+    return applyMaterialUpdate(id, patch)
   }
 
-  /** 更新炮制方式并同步到字典 */
-  async function setProcessMethod(id: string, processMethod: ProcessMethod): Promise<void> {
-    await materialTable.update(id, { processMethod })
+  /** 更新炮制方式（写法变化，会抬修订号并重算未入窖快照）并同步到字典 */
+  async function setProcessMethod(
+    id: string,
+    processMethod: ProcessMethod
+  ): Promise<{ revision: number; writingChanged: boolean; recalcedBatches: number }> {
+    const result = await applyMaterialUpdate(id, { processMethod })
     if (!processMethodDictionary.value.includes(processMethod)) {
       processMethodDictionary.value = [...processMethodDictionary.value, processMethod]
     }
+    return result
   }
 
-  /** 删除香料：同时级联删除引用它的配比记录（配比合计会因此变化） */
+  /**
+   * 删除香料：同时级联删除引用它的配比并重算相关未入窖批次快照
+   *（已入窖批次保留当时写法；配比合计会因此变化）
+   */
   async function removeMaterial(
     id: string
-  ): Promise<{ proportions: number; formulaIds: string[] }> {
-    const list = proportionsByMaterial.value[id] ?? []
-    const proportionIds = list.map((item) => item.id)
-    const formulaIds = Array.from(new Set(list.map((item) => item.formulaId)))
-    await db.transaction('rw', [db.materials, db.proportions], async () => {
-      await db.proportions.bulkDelete(proportionIds)
-      await db.materials.delete(id)
-    })
-    return { proportions: proportionIds.length, formulaIds }
+  ): Promise<{ proportions: number; formulaIds: string[]; recalcedBatches: number }> {
+    return applyMaterialRemoval(id)
   }
 
   /** 批量删除未被引用的香料，用于香料库清理 */

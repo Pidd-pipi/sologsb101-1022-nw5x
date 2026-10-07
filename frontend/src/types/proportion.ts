@@ -15,6 +15,11 @@ export interface Proportion {
   note: string
   /** 君臣佐使编排顺序（拖拽排序回写） */
   seq: number
+  /**
+   * 绑定的香料主档修订号：保存配比时香料当时的 revision。
+   * 与主档 revision 不一致即说明主档已改等级 / 炮制，这行配比停在旧写法上。
+   */
+  materialRevision: number
   updatedAt: number
 }
 

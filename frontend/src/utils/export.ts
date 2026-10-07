@@ -18,9 +18,11 @@ import {
 } from '@/types/formula'
 import { MATERIAL_GRADES, PROCESS_METHODS, type Material, type MaterialGrade, type ProcessMethod } from '@/types/material'
 import { PROPORTION_ROLES, type Proportion, type ProportionRole } from '@/types/proportion'
-import { FORMING_METHODS, type Batch, type FormingMethod } from '@/types/batch'
+import { FORMING_METHODS, type Batch, type BatchSnapshotItem, type FormingMethod } from '@/types/batch'
 import { CELLAR_CONTAINERS, CELLAR_STATES, type Cellar, type CellarState, type CellarContainer } from '@/types/cellar'
 import type { Tasting } from '@/types/tasting'
+import { INITIAL_MATERIAL_REVISION } from '@/types/material'
+import { MATERIAL_REMOVED_WRITING, revisionOf } from '@/utils/master'
 
 /** 单方香方导出文件结构：一个香方 + 其配比 + 派生批次、窖藏、品香 */
 export interface FormulaExportPayload {
@@ -213,6 +215,7 @@ function parseMaterial(raw: unknown, errors: string[], index: number): Material 
     processMethod: pickEnum<ProcessMethod>(raw.processMethod, PROCESS_METHOD_SET, '生用'),
     aromaNote: asString(raw.aromaNote),
     createdAt: asString(raw.createdAt, new Date().toISOString().slice(0, 10)),
+    revision: Math.max(1, Math.trunc(asNumber(raw.revision, INITIAL_MATERIAL_REVISION))),
     updatedAt: asNumber(raw.updatedAt, Date.now())
   }
 }
@@ -248,6 +251,7 @@ export function validateFormulaJson(input: unknown): ValidateResult<FormulaExpor
       materialIds.add(material.id)
     }
   })
+  const importMaterialMap = new Map(materials.map((material) => [material.id, material]))
 
   const proportions: Proportion[] = []
   ;(input.proportions as unknown[]).forEach((raw, index) => {
@@ -277,6 +281,7 @@ export function validateFormulaJson(input: unknown): ValidateResult<FormulaExpor
       role: raw.role as ProportionRole,
       note: asString(raw.note),
       seq: asNumber(raw.seq, index + 1),
+      materialRevision: Math.max(1, Math.trunc(asNumber(raw.materialRevision, INITIAL_MATERIAL_REVISION))),
       updatedAt: asNumber(raw.updatedAt, Date.now())
     })
   })
@@ -300,14 +305,22 @@ export function validateFormulaJson(input: unknown): ValidateResult<FormulaExpor
       quantity: asNumber(raw.quantity, 0),
       operator: asString(raw.operator),
       snapshot: Array.isArray(raw.snapshot)
-        ? (raw.snapshot as unknown[]).filter(isRecord).map((item) => ({
-            materialId: asString(item.materialId),
-            materialName: asString(item.materialName, '未知香料'),
-            ratio: asNumber(item.ratio, 0),
-            role: asString(item.role, '君')
-          }))
+        ? (raw.snapshot as unknown[]).filter(isRecord).map((item) => {
+            const material = importMaterialMap.get(asString(item.materialId))
+            return {
+              materialId: asString(item.materialId),
+              materialName: material?.name ?? asString(item.materialName, '未知香料'),
+              ratio: asNumber(item.ratio, 0),
+              role: asString(item.role, '君'),
+              grade: asString(item.grade, material?.grade ?? MATERIAL_REMOVED_WRITING),
+              processMethod: asString(item.processMethod, material?.processMethod ?? MATERIAL_REMOVED_WRITING),
+              materialRevision: Math.max(1, Math.trunc(asNumber(item.materialRevision, revisionOf(material))))
+            }
+          })
         : [],
       snapshotAt: asNumber(raw.snapshotAt, 0),
+      locked: Boolean(raw.locked),
+      lockedAt: asNumber(raw.lockedAt, 0),
       updatedAt: asNumber(raw.updatedAt, Date.now())
     })
   })
@@ -401,8 +414,166 @@ export function validateSnapshotJson(input: unknown): ValidateResult<IncenseSnap
     if (!Array.isArray(input[key])) errors.push(`${key} 字段缺失或不是数组`)
   })
   if (errors.length > 0) return { ok: false, errors, payload: null }
-  const snapshot = input as unknown as IncenseSnapshot
+  const raw = input as Record<string, unknown[]>
+
+  // 规范化主档 / 配比 / 批次，兜底修订号与快照锁定写法，避免旧版本文件导入后对不上
+  const parseErrors: string[] = []
+  const materials: Material[] = raw.materials
+    .map((item, index) => parseMaterial(item, parseErrors, index))
+    .filter((item): item is Material => item !== null)
+  const importMaterialMap = new Map(materials.map((material) => [material.id, material]))
+  const proportions: Proportion[] = raw.proportions
+    .map((item) => {
+      if (!isRecord(item)) return null
+      const materialId = asString(item.materialId)
+      const role = asString(item.role)
+      if (!ROLE_SET.has(role) || materialId.length === 0) return null
+      return {
+        id: asString(item.id, createId('prop')),
+        formulaId: asString(item.formulaId),
+        materialId,
+        ratio: asNumber(item.ratio, 0),
+        role: role as ProportionRole,
+        note: asString(item.note),
+        seq: asNumber(item.seq, 0),
+        materialRevision: Math.max(1, Math.trunc(asNumber(item.materialRevision, INITIAL_MATERIAL_REVISION))),
+        updatedAt: asNumber(item.updatedAt, Date.now())
+      }
+    })
+    .filter((item): item is Proportion => item !== null && item.formulaId.length > 0)
+
+  const lockedBatchIds = new Set(
+    raw.cellars
+      .filter(isRecord)
+      .map((cellar) => asString(cellar.batchId))
+      .filter((batchId) => batchId.length > 0)
+  )
+  const batches: Batch[] = raw.batches
+    .map((item) => {
+      if (!isRecord(item)) return null
+      const snapshot: BatchSnapshotItem[] = Array.isArray(item.snapshot)
+        ? item.snapshot.filter(isRecord).map((snap) => {
+            const material = importMaterialMap.get(asString(snap.materialId))
+            return {
+              materialId: asString(snap.materialId),
+              materialName: material?.name ?? asString(snap.materialName, '未知香料'),
+              ratio: asNumber(snap.ratio, 0),
+              role: asString(snap.role, '君'),
+              grade: asString(snap.grade, material?.grade ?? MATERIAL_REMOVED_WRITING),
+              processMethod: asString(snap.processMethod, material?.processMethod ?? MATERIAL_REMOVED_WRITING),
+              materialRevision: Math.max(1, Math.trunc(asNumber(snap.materialRevision, revisionOf(material))))
+            }
+          })
+        : []
+      return {
+        id: asString(item.id, createId('batch')),
+        formulaId: asString(item.formulaId),
+        mixedAt: asString(item.mixedAt, new Date().toISOString().slice(0, 10)),
+        formingMethod: pickEnum<FormingMethod>(item.formingMethod, FORMING_SET, '挤条'),
+        quantity: asNumber(item.quantity, 0),
+        operator: asString(item.operator),
+        snapshot,
+        snapshotAt: asNumber(item.snapshotAt, 0),
+        locked: Boolean(item.locked),
+        lockedAt: asNumber(item.lockedAt, 0),
+        updatedAt: asNumber(item.updatedAt, Date.now())
+      }
+    })
+    .filter((item): item is Batch => item !== null && item.formulaId.length > 0)
+
+  const reconciled = reconcileImportedData({ materials, proportions, batches, lockedBatchIds })
+
+  const snapshot: IncenseSnapshot = {
+    app: 'gbincense',
+    dbVersion: asNumber(input.dbVersion, DB_VERSION),
+    exportedAt: asString(input.exportedAt, new Date().toISOString()),
+    formulas: raw.formulas as Formula[],
+    materials: reconciled.materials,
+    proportions: reconciled.proportions,
+    batches: reconciled.batches,
+    cellars: raw.cellars as Cellar[],
+    tastings: raw.tastings as Tasting[]
+  }
+  if (parseErrors.length > 0) return { ok: false, errors: parseErrors.slice(0, 5), payload: null }
   return { ok: true, errors: [], payload: snapshot }
+}
+
+/**
+ * 导入调和：让带入的数据与「主档修订号」机制对齐。
+ * - 按材料映射重定向快照里的 materialId 与修订号；
+ * - 已锁定批次保留导入快照的当时写法（修订号缺失则按当前主档回填）；
+ * - 未锁定批次按当前配比 + 当前主档重算快照，保证导出档案与主档一致。
+ */
+function reconcileImportedData(input: {
+  materials: Material[]
+  proportions: Proportion[]
+  batches: Batch[]
+  lockedBatchIds?: Set<string>
+}): { materials: Material[]; proportions: Proportion[]; batches: Batch[] } {
+  const materials = input.materials
+  const materialMap = new Map(materials.map((material) => [material.id, material]))
+  const proportionsByFormula = new Map<string, Proportion[]>()
+  input.proportions.forEach((proportion) => {
+    const list = proportionsByFormula.get(proportion.formulaId) ?? []
+    list.push(proportion)
+    proportionsByFormula.set(proportion.formulaId, list)
+  })
+
+  const proportions = input.proportions.map((proportion) => ({
+    ...proportion,
+    materialRevision: revisionOf(materialMap.get(proportion.materialId))
+  }))
+
+  const lockedBatchIds = input.lockedBatchIds ?? new Set<string>()
+  const batches = input.batches.map((batch) => {
+    const locked = batch.locked || lockedBatchIds.has(batch.id)
+    let snapshot: BatchSnapshotItem[]
+    if (locked) {
+      snapshot = batch.snapshot.map((item) => {
+        const material = materialMap.get(item.materialId)
+        // 锁定档案优先保留文件里固化的当时写法；旧文件缺字段时才回落到当前主档
+        const grade = item.grade && item.grade !== MATERIAL_REMOVED_WRITING ? item.grade : material?.grade ?? MATERIAL_REMOVED_WRITING
+        const processMethod =
+          item.processMethod && item.processMethod !== MATERIAL_REMOVED_WRITING
+            ? item.processMethod
+            : material?.processMethod ?? MATERIAL_REMOVED_WRITING
+        return {
+          ...item,
+          materialName: material?.name ?? item.materialName,
+          grade,
+          processMethod,
+          materialRevision:
+            Number.isFinite(item.materialRevision) && item.materialRevision > 0
+              ? item.materialRevision
+              : revisionOf(material)
+        }
+      })
+    } else {
+      const list = proportionsByFormula.get(batch.formulaId) ?? []
+      snapshot = [...list]
+        .sort((a, b) => a.seq - b.seq)
+        .map((proportion) => {
+          const material = materialMap.get(proportion.materialId)
+          return {
+            materialId: proportion.materialId,
+            materialName: material?.name ?? '未知香料',
+            ratio: proportion.ratio,
+            role: proportion.role,
+            grade: material?.grade ?? MATERIAL_REMOVED_WRITING,
+            processMethod: material?.processMethod ?? MATERIAL_REMOVED_WRITING,
+            materialRevision: revisionOf(material)
+          }
+        })
+    }
+    return {
+      ...batch,
+      locked,
+      lockedAt: locked ? batch.lockedAt || batch.snapshotAt || Date.now() : 0,
+      snapshot
+    }
+  })
+
+  return { materials, proportions, batches }
 }
 
 /**
@@ -417,13 +588,19 @@ export async function importFormulaPayload(
   const batchIdMap = new Map<string, string>()
 
   const now = Date.now()
+  // 先按导入的主档调和修订号与快照，再 remap id，保持单方内部写法一致
+  const reconciled = reconcileImportedData({
+    materials: payload.materials,
+    proportions: payload.proportions,
+    batches: payload.batches
+  })
   const formula: Formula = { ...payload.formula, id: formulaId, updatedAt: now }
-  const materials: Material[] = payload.materials.map((material) => {
+  const materials: Material[] = reconciled.materials.map((material) => {
     const id = createId('material')
     materialIdMap.set(material.id, id)
     return { ...material, id, updatedAt: now }
   })
-  const proportions: Proportion[] = payload.proportions.map((proportion, index) => ({
+  const proportions: Proportion[] = reconciled.proportions.map((proportion, index) => ({
     ...proportion,
     id: createId('prop'),
     formulaId,
@@ -431,7 +608,7 @@ export async function importFormulaPayload(
     seq: proportion.seq > 0 ? proportion.seq : index + 1,
     updatedAt: now
   }))
-  const batches: Batch[] = payload.batches.map((batch) => {
+  const batches: Batch[] = reconciled.batches.map((batch) => {
     const id = createId('batch')
     batchIdMap.set(batch.id, id)
     return {

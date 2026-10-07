@@ -571,6 +571,15 @@ const formingText = (batchId: string): FormingMethod | '—' =>
           :title="`该批次所属香方配比合计：${ratioTotal}%（${ratioRows.length} 味）`"
           :description="ratioMessage"
         />
+        <el-alert
+          v-if="!editingId"
+          class="ratio-alert"
+          type="info"
+          :closable="false"
+          show-icon
+          title="登记入窖即锁定该批次快照"
+          description="入窖后香料主档再改等级 / 炮制，本批次与品鉴档案都保留入窖当时的写法；删除窖藏记录后解锁并按最新主档重算。"
+        />
       </el-form>
       <template #footer>
         <el-button @click="dialogVisible = false">取消</el-button>

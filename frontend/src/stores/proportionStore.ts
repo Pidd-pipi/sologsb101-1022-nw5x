@@ -11,6 +11,7 @@ import {
   type RatioCheck
 } from '@/types/proportion'
 import { checkRatioTotal, round, sortByRoleWeight, sumRatios } from '@/utils/ratio'
+import { MasterConflictError, revisionOf } from '@/utils/master'
 
 /** 当前配比草稿行的校验结果 */
 export interface ProportionDraftCheck {
@@ -176,9 +177,25 @@ export const useProportionStore = defineStore('proportion', () => {
     role: ProportionRole
     note: string
     seq?: number
+    /** 表单打开时看到的主档修订号，用于乐观并发校验 */
+    baseMaterialRevision?: number
   }): Promise<Proportion> {
     const list = proportionsByFormula(payload.formulaId)
     try {
+      const material = await db.materials.get(payload.materialId)
+      const currentRevision = revisionOf(material)
+      if (
+        payload.baseMaterialRevision !== undefined &&
+        material &&
+        payload.baseMaterialRevision !== currentRevision
+      ) {
+        throw new MasterConflictError({
+          materialId: payload.materialId,
+          expectedRevision: payload.baseMaterialRevision,
+          actualRevision: currentRevision,
+          latest: material ?? null
+        })
+      }
       return await proportionTable.create(
         {
           formulaId: payload.formulaId,
@@ -186,18 +203,52 @@ export const useProportionStore = defineStore('proportion', () => {
           ratio: round(payload.ratio, 2),
           role: payload.role,
           note: payload.note,
-          seq: payload.seq ?? (list.length === 0 ? 1 : Math.max(...list.map((item) => item.seq)) + 1)
+          seq: payload.seq ?? (list.length === 0 ? 1 : Math.max(...list.map((item) => item.seq)) + 1),
+          materialRevision: currentRevision
         },
         'prop'
       )
     } catch (err) {
+      if (err instanceof MasterConflictError) throw err
       lastError.value = err instanceof Error ? err.message : '新增配比失败'
       throw err
     }
   }
 
-  async function updateProportion(id: string, patch: Partial<Proportion>): Promise<void> {
-    await proportionTable.update(id, patch)
+  /**
+   * 更新配比。传 baseMaterialRevision 时做乐观并发校验：
+   * 另一页面已改主档导致修订号前移，则抛 MasterConflictError，草稿保留在表单里可重试。
+   */
+  async function updateProportion(
+    id: string,
+    patch: Partial<Proportion>,
+    baseMaterialRevision?: number
+  ): Promise<void> {
+    if (baseMaterialRevision !== undefined) {
+      const existing = await db.proportions.get(id)
+      if (existing) {
+        const material = await db.materials.get(existing.materialId)
+        const currentRevision = revisionOf(material)
+        if (baseMaterialRevision !== currentRevision) {
+          throw new MasterConflictError({
+            materialId: existing.materialId,
+            expectedRevision: baseMaterialRevision,
+            actualRevision: currentRevision,
+            latest: material ?? null
+          })
+        }
+      }
+    }
+    const next: Partial<Proportion> = { ...patch }
+    // 正常保存即把这行配比对齐到最新主档修订号（未固化配比永远跟随最新主档）
+    if (patch.materialRevision === undefined) {
+      const existing = await db.proportions.get(id)
+      if (existing) {
+        const material = await db.materials.get(existing.materialId)
+        if (material) next.materialRevision = revisionOf(material)
+      }
+    }
+    await proportionTable.update(id, next)
   }
 
   async function removeProportion(id: string): Promise<void> {

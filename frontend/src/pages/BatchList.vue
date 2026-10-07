@@ -14,6 +14,7 @@ import { useIdbTable } from '@/hooks/useIdbTable'
 import { useProportion } from '@/hooks/useProportion'
 import { db } from '@/utils/db'
 import { round } from '@/utils/ratio'
+import { buildSnapshotItems, countStaleSnapshotItems, buildMaterialMap, revisionOf } from '@/utils/master'
 import {
   FORMING_METHODS,
   createEmptyBatchFilter,
@@ -140,8 +141,9 @@ const hasFilter = computed(
     filter.value.formingMethods.length > 0
 )
 
-const rows = computed<BatchRow[]>(() =>
-  batchTable.rows.value.map((batch) => {
+const rows = computed<BatchRow[]>(() => {
+  const materialMap = buildMaterialMap(materialStore.materials)
+  return batchTable.rows.value.map((batch) => {
     const currentRatioTotal = proportionStore.totalByFormula[batch.formulaId] ?? 0
     const snapshotRatioTotal = round(
       batch.snapshot.reduce((sum, item) => sum + item.ratio, 0),
@@ -155,10 +157,11 @@ const rows = computed<BatchRow[]>(() =>
       currentRatioTotal,
       snapshotRatioTotal,
       cellared: cellars.length > 0,
-      cellarState: cellars.length === 0 ? '未入窖' : cellars.map((cellar) => cellar.state).join(' / ')
+      cellarState: cellars.length === 0 ? '未入窖' : cellars.map((cellar) => cellar.state).join(' / '),
+      staleMaterialCount: batch.locked ? 0 : countStaleSnapshotItems(batch.snapshot, materialMap)
     }
   })
-)
+})
 
 const filteredRows = computed<BatchRow[]>(() =>
   rows.value.filter((row) => {
@@ -175,10 +178,12 @@ const filteredRows = computed<BatchRow[]>(() =>
 )
 
 const totalQuantity = computed(() => filteredRows.value.reduce((sum, row) => sum + row.batch.quantity, 0))
-const cellaredCount = computed(() => rows.value.filter((row) => row.cellared).length)
 const driftedCount = computed(() =>
   rows.value.filter((row) => Math.abs(row.currentRatioTotal - row.snapshotRatioTotal) > 0.01).length
 )
+/** 未入窖但快照停在旧主档写法的批次数（理论上保存即重算，该值主要用于导入后兜底提示） */
+const staleMasterCount = computed(() => rows.value.filter((row) => !row.batch.locked && row.staleMaterialCount > 0).length)
+const lockedCount = computed(() => rows.value.filter((row) => row.batch.locked).length)
 const averageQuantity = computed(() =>
   rows.value.length === 0 ? 0 : Math.round(rows.value.reduce((sum, row) => sum + row.batch.quantity, 0) / rows.value.length)
 )
@@ -188,15 +193,27 @@ const detailRow = computed<BatchRow | null>(() => rows.value.find((row) => row.b
 /** 香方 id → 配比味数，用于快照对照时回显 */
 const proportionCountMap = computed<Record<string, number>>(() => proportionStore.materialCountMap)
 
-/** 对照快照与当前方子：返回差异说明文案 */
+/** 对照快照与当前方子：返回差异说明文案（已入窖批次保留当时写法，仅展示主档变化） */
 function snapshotDiff(item: BatchSnapshotItem, row: BatchRow): string {
   const currentItem = proportionStore
     .proportionsByFormula(row.batch.formulaId)
     .find((proportion) => proportion.materialId === item.materialId)
+  const currentMaterial = materialStore.materialById(item.materialId)
+  const writingChanged =
+    currentMaterial &&
+    (currentMaterial.grade !== item.grade ||
+      currentMaterial.processMethod !== item.processMethod ||
+      revisionOf(currentMaterial) !== item.materialRevision)
   if (!currentItem) return '已从方中移除'
   const delta = round(currentItem.ratio - item.ratio, 2)
-  if (delta === 0) return '与当前一致'
-  return `当前 ${currentItem.ratio}%（${delta > 0 ? '+' : ''}${delta}%）`
+  const parts: string[] = []
+  if (delta !== 0) parts.push(`占比 ${currentItem.ratio}%（${delta > 0 ? '+' : ''}${delta}%）`)
+  if (writingChanged && currentMaterial) {
+    parts.push(`主档已改为 ${currentMaterial.grade} / ${currentMaterial.processMethod}`)
+  }
+  if (parts.length === 0) return '与当前一致'
+  if (row.batch.locked) return `${parts.join('；')} · 已入窖锁定当时写法`
+  return parts.join('；')
 }
 
 function handleFilterChange(value: FilterModel): void {
@@ -214,25 +231,14 @@ function handleReset(): void {
 }
 
 async function buildSnapshot(formulaId: string): Promise<BatchSnapshotItem[]> {
+  const materialMap = buildMaterialMap(materialStore.materials)
   const proportions = proportionStore.proportionsByFormula(formulaId)
   if (proportions.length > 0) {
-    return proportions
-      .slice()
-      .sort((a, b) => a.seq - b.seq)
-      .map((proportion) => ({
-        materialId: proportion.materialId,
-        materialName: materialStore.materialName(proportion.materialId),
-        ratio: round(proportion.ratio, 2),
-        role: proportion.role
-      }))
+    return buildSnapshotItems(proportions, materialMap)
   }
   const list = await db.proportions.where('formulaId').equals(formulaId).toArray()
-  return list.map((proportion) => ({
-    materialId: proportion.materialId,
-    materialName: materialStore.materialName(proportion.materialId),
-    ratio: round(proportion.ratio, 2),
-    role: proportion.role
-  }))
+  const allMaterials = await db.materials.toArray()
+  return buildSnapshotItems(list, buildMaterialMap(allMaterials))
 }
 
 function openCreate(): void {
@@ -280,7 +286,9 @@ async function submitForm(): Promise<void> {
           quantity: form.quantity,
           operator: form.operator.trim(),
           snapshot,
-          snapshotAt: Date.now()
+          snapshotAt: Date.now(),
+          locked: false,
+          lockedAt: 0
         },
         'batch'
       )
@@ -312,9 +320,13 @@ async function removeBatch(row: BatchRow): Promise<void> {
 }
 
 async function refreshSnapshot(row: BatchRow): Promise<void> {
+  if (row.batch.locked) {
+    ElMessage.warning('该批次已入窖，快照锁定了当时的等级 / 炮制写法，不能按当前方子重置')
+    return
+  }
   const snapshot = await buildSnapshot(row.batch.formulaId)
   await batchTable.update(row.batch.id, { snapshot, snapshotAt: Date.now() })
-  ElMessage.success('已按当前配比重置快照')
+  ElMessage.success('已按当前配比与最新主档重置快照')
 }
 
 function openDetail(row: BatchRow): void {
@@ -339,8 +351,8 @@ function goProportion(row: BatchRow): void {
       <div>
         <h2>和香工序与成型登记</h2>
         <p>
-          共 {{ rows.length }} 个批次 · 已入窖 {{ cellaredCount }} 个 · 配比改动 {{ driftedCount }} 个 · 当前筛选
-          {{ filteredRows.length }} 个
+          共 {{ rows.length }} 个批次 · 已入窖锁定 {{ lockedCount }} 个 · 配比改动 {{ driftedCount }} 个 ·
+          主档待重算 {{ staleMasterCount }} 个 · 当前筛选 {{ filteredRows.length }} 个
         </p>
       </div>
       <div class="page-title__actions">
@@ -351,8 +363,9 @@ function goProportion(row: BatchRow): void {
     <div class="stat-row">
       <StatBadge label="批次总数" :value="rows.length" suffix="个" icon="Box" tone="primary" />
       <StatBadge label="筛选中数量" :value="totalQuantity" suffix="支/丸" icon="Histogram" tone="info" />
-      <StatBadge label="已入窖" :value="cellaredCount" suffix="个" icon="Coin" tone="success" />
+      <StatBadge label="已入窖锁定" :value="lockedCount" suffix="个" icon="Lock" tone="success" hint="入窖即锁住当时等级 / 炮制写法" />
       <StatBadge label="配比已改动" :value="driftedCount" suffix="个" icon="Document" tone="warning" hint="当前配比合计与批次快照不一致" />
+      <StatBadge label="主档待重算" :value="staleMasterCount" suffix="个" icon="Refresh" tone="danger" hint="未入窖批次中停在旧主档写法的快照" />
       <StatBadge label="平均产量" :value="averageQuantity" suffix="支/丸" icon="TrendCharts" tone="default" />
     </div>
 
@@ -405,9 +418,11 @@ function goProportion(row: BatchRow): void {
             </div>
           </template>
         </el-table-column>
-        <el-table-column label="窖藏状态" width="140">
+        <el-table-column label="窖藏状态" width="150">
           <template #default="{ row }: { row: BatchRow }">
-            <el-tag :type="row.cellared ? 'success' : 'info'" effect="plain" round>{{ row.cellarState }}</el-tag>
+            <el-tag :type="row.batch.locked ? 'success' : 'info'" effect="plain" round>
+              {{ row.batch.locked ? '已锁定 · ' + row.cellarState : '未入窖' }}
+            </el-tag>
           </template>
         </el-table-column>
         <el-table-column label="操作" width="300" fixed="right">
@@ -476,6 +491,13 @@ function goProportion(row: BatchRow): void {
             {{ detailRow.batch.operator }}
           </p>
           <p class="muted">快照固化于 {{ new Date(detailRow.batch.snapshotAt || Date.now()).toLocaleString('zh-CN') }}</p>
+          <el-tag :type="detailRow.batch.locked ? 'success' : 'warning'" effect="dark" round>
+            {{
+              detailRow.batch.locked
+                ? `已入窖锁定（${new Date(detailRow.batch.lockedAt).toLocaleDateString('zh-CN')}），等级 / 炮制保留当时写法`
+                : '未入窖：主档改动后快照自动按最新写法重算'
+            }}
+          </el-tag>
         </div>
 
         <div class="snapshot-badges">
@@ -492,14 +514,20 @@ function goProportion(row: BatchRow): void {
         </div>
 
         <el-table :data="detailRow.batch.snapshot" size="small" row-key="materialId">
-          <el-table-column label="香料" prop="materialName" min-width="120" />
-          <el-table-column label="角色" prop="role" width="70" />
-          <el-table-column label="快照占比" width="100">
+          <el-table-column label="香料" prop="materialName" min-width="110" />
+          <el-table-column label="等级 / 炮制" min-width="130">
+            <template #default="{ row }: { row: BatchSnapshotItem }">
+              <div class="cell-sub">{{ row.grade }} · {{ row.processMethod }}</div>
+              <div class="cell-sub muted">v{{ row.materialRevision }}</div>
+            </template>
+          </el-table-column>
+          <el-table-column label="角色" prop="role" width="64" />
+          <el-table-column label="快照占比" width="90">
             <template #default="{ row }: { row: BatchSnapshotItem }">
               <span class="mono">{{ row.ratio }}%</span>
             </template>
           </el-table-column>
-          <el-table-column label="与当前对比" min-width="140">
+          <el-table-column label="与当前对比" min-width="160">
             <template #default="{ row }: { row: BatchSnapshotItem }">
               <span class="cell-sub">{{ snapshotDiff(row, detailRow) }}</span>
             </template>
@@ -507,7 +535,16 @@ function goProportion(row: BatchRow): void {
         </el-table>
 
         <div class="snapshot-actions">
-          <el-button :icon="Document" @click="refreshSnapshot(detailRow)">按当前配比重置快照</el-button>
+          <el-tooltip
+            v-if="detailRow.batch.locked"
+            content="已入窖批次锁定当时写法，如需调整请先删除该批次的窖藏记录"
+            placement="top"
+          >
+            <span>
+              <el-button :icon="Document" disabled>按当前配比重置快照</el-button>
+            </span>
+          </el-tooltip>
+          <el-button v-else :icon="Document" @click="refreshSnapshot(detailRow)">按当前配比重置快照</el-button>
           <el-button :icon="Histogram" @click="goProportion(detailRow)">去改配比</el-button>
         </div>
       </template>

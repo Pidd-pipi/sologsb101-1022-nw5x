@@ -1,13 +1,14 @@
 import Dexie, { type Table } from 'dexie'
 import type { Formula } from '@/types/formula'
-import type { Material } from '@/types/material'
+import { INITIAL_MATERIAL_REVISION, type Material } from '@/types/material'
 import type { Proportion } from '@/types/proportion'
 import type { Batch } from '@/types/batch'
 import type { Cellar } from '@/types/cellar'
 import type { Tasting } from '@/types/tasting'
+import { buildMaterialMap, buildSnapshotItems, MATERIAL_REMOVED_WRITING, revisionOf } from '@/utils/master'
 
 /** 本地结构版本号：新增/修改表结构时必须递增，并补充 upgrade 迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** 本地存储键名（localStorage 侧的少量元数据） */
 export const LS_KEYS = {
@@ -105,6 +106,84 @@ export class IncenseDatabase extends Dexie {
           .modify((tasting) => {
             if (typeof tasting.lastingMin !== 'number' || Number.isNaN(tasting.lastingMin)) {
               tasting.lastingMin = 0
+            }
+          })
+      })
+    // v3：香料主档修订号 + 配比绑定修订号 + 批次快照锁定（已入窖锁住当时写法）
+    this.version(DB_VERSION)
+      .stores({
+        formulas: 'id, name, scentType, usage, state, createdAt, totalRatio, updatedAt',
+        materials: 'id, name, origin, grade, processMethod, revision, updatedAt',
+        proportions: 'id, formulaId, materialId, role, seq, updatedAt',
+        batches: 'id, formulaId, mixedAt, formingMethod, locked, updatedAt',
+        cellars: 'id, batchId, startDate, endDate, state, updatedAt',
+        tastings: 'id, batchId, tastedAt, smokeScore, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        // 已有数据没有修订号：按当前值回填起始修订号，视为「现在就是第一版」
+        await tx
+          .table<Material>('materials')
+          .toCollection()
+          .modify((material) => {
+            if (!Number.isFinite(material.revision) || material.revision <= 0) {
+              material.revision = INITIAL_MATERIAL_REVISION
+            }
+          })
+
+        const materials = await tx.table<Material>('materials').toArray()
+        const materialMap = buildMaterialMap(materials)
+        const proportions = await tx.table<Proportion>('proportions').toArray()
+
+        // 配比回填绑定修订号：按当前主档对齐，升级后不标失效
+        const proportionRevision = new Map<string, number>()
+        proportions.forEach((proportion) => {
+          proportionRevision.set(proportion.id, revisionOf(materialMap.get(proportion.materialId)))
+        })
+        await tx
+          .table<Proportion>('proportions')
+          .toCollection()
+          .modify((proportion) => {
+            if (!Number.isFinite(proportion.materialRevision) || proportion.materialRevision <= 0) {
+              proportion.materialRevision = proportionRevision.get(proportion.id) ?? INITIAL_MATERIAL_REVISION
+            }
+          })
+
+        // 已入窖的批次在升级当刻锁住：按当时配比 + 当前主档补齐等级 / 炮制写法后锁定
+        const cellars = await tx.table<Cellar>('cellars').toArray()
+        const lockedBatchIds = new Set(cellars.map((cellar) => cellar.batchId))
+        const proportionsByFormula = new Map<string, Proportion[]>()
+        proportions.forEach((proportion) => {
+          const list = proportionsByFormula.get(proportion.formulaId) ?? []
+          list.push(proportion)
+          proportionsByFormula.set(proportion.formulaId, list)
+        })
+        await tx
+          .table<Batch>('batches')
+          .toCollection()
+          .modify((batch) => {
+            const wasLocked = lockedBatchIds.has(batch.id)
+            batch.locked = wasLocked
+            if (!Number.isFinite(batch.lockedAt)) batch.lockedAt = 0
+            if (!Array.isArray(batch.snapshot)) batch.snapshot = []
+            // 未入窖批次按当前配比与最新主档整体重算；已入窖批次保留占比 / 角色，只补齐锁定写法
+            if (wasLocked) {
+              batch.snapshot = batch.snapshot.map((item) => {
+                const material = materialMap.get(item.materialId)
+                return {
+                  materialId: item.materialId,
+                  materialName: material?.name ?? item.materialName ?? '未知香料',
+                  ratio: item.ratio,
+                  role: item.role,
+                  grade: material?.grade ?? MATERIAL_REMOVED_WRITING,
+                  processMethod: material?.processMethod ?? MATERIAL_REMOVED_WRITING,
+                  materialRevision: revisionOf(material)
+                }
+              })
+              if (!batch.lockedAt) batch.lockedAt = batch.snapshotAt || Date.now()
+            } else {
+              const list = proportionsByFormula.get(batch.formulaId) ?? []
+              batch.snapshot = buildSnapshotItems(list, materialMap)
+              batch.snapshotAt = batch.snapshotAt || Date.now()
             }
           })
       })
@@ -313,6 +392,7 @@ export async function seedDatabase(): Promise<void> {
       processMethod: '生用',
       aromaNote: '清甜带凉，尾韵有蔗糖气',
       createdAt: '2024-02-18',
+      revision: INITIAL_MATERIAL_REVISION,
       updatedAt: now
     },
     {
@@ -323,6 +403,7 @@ export async function seedDatabase(): Promise<void> {
       processMethod: '酒蒸',
       aromaNote: '奶香厚重，留香绵长',
       createdAt: '2024-02-20',
+      revision: INITIAL_MATERIAL_REVISION,
       updatedAt: now
     },
     {
@@ -333,6 +414,7 @@ export async function seedDatabase(): Promise<void> {
       processMethod: '醋浸',
       aromaNote: '树脂清香，微带柑橘前调',
       createdAt: '2024-04-02',
+      revision: INITIAL_MATERIAL_REVISION,
       updatedAt: now
     },
     {
@@ -343,6 +425,7 @@ export async function seedDatabase(): Promise<void> {
       processMethod: '炒黄',
       aromaNote: '辛香穿透，少许即显',
       createdAt: '2024-04-06',
+      revision: INITIAL_MATERIAL_REVISION,
       updatedAt: now
     }
   ]
@@ -361,6 +444,7 @@ export async function seedDatabase(): Promise<void> {
         role: row[3],
         note: row[4],
         seq: index + 1,
+        materialRevision: INITIAL_MATERIAL_REVISION,
         updatedAt: now
       })
     })
@@ -375,10 +459,15 @@ export async function seedDatabase(): Promise<void> {
         materialId: row[0],
         materialName: material?.name ?? '未知香料',
         ratio: row[2],
-        role: row[3]
+        role: row[3],
+        grade: material?.grade ?? MATERIAL_REMOVED_WRITING,
+        processMethod: material?.processMethod ?? MATERIAL_REMOVED_WRITING,
+        materialRevision: revisionOf(material)
       }
     })
 
+  const lineSnapshotAt = new Date('2024-04-01T09:00:00').getTime()
+  const pillSnapshotAt = new Date('2024-06-15T14:30:00').getTime()
   const batches: Batch[] = [
     {
       id: SEED_IDS.batchLine,
@@ -388,7 +477,9 @@ export async function seedDatabase(): Promise<void> {
       quantity: 320,
       operator: '林砚舟',
       snapshot: toSnapshot(lineRatio),
-      snapshotAt: new Date('2024-04-01T09:00:00').getTime(),
+      snapshotAt: lineSnapshotAt,
+      locked: true,
+      lockedAt: new Date('2024-04-05T10:00:00').getTime(),
       updatedAt: now
     },
     {
@@ -399,7 +490,9 @@ export async function seedDatabase(): Promise<void> {
       quantity: 120,
       operator: '周若谷',
       snapshot: toSnapshot(pillRatio),
-      snapshotAt: new Date('2024-06-15T14:30:00').getTime(),
+      snapshotAt: pillSnapshotAt,
+      locked: true,
+      lockedAt: new Date('2024-06-20T09:30:00').getTime(),
       updatedAt: now
     }
   ]
